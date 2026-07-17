@@ -23,7 +23,7 @@
     "audit:ci": "npm audit --audit-level=high"
   },
   "dependencies": {
-    "@sentry/react": "^10.47.0",
+    "@sentry/react": "^10.66.0",
     "@stellar/freighter-api": "^6.0.1",
     "@tailwindcss/postcss": "^4.2.2",
     "i18next": "^26.0.4",
