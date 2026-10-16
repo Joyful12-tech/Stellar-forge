@@ -165,3 +165,29 @@ jobs:
       - name: Stop Local Stellar Network
         if: always()
         run: docker compose -f docker-compose.e2e.yml down
+
+  controller:
+    name: Operator (controller)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: controller
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+        working-directory: controller
+
+      - name: Run clippy
+        run: cargo clippy --all-targets -- -D warnings
+        working-directory: controller
+
+      - name: Run controller tests
+        run: cargo test
+        working-directory: controller

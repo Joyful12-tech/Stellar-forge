@@ -41,13 +41,44 @@ jobs:
           path: frontend/storybook-static
 
   deploy:
-    if: github.ref == 'refs/heads/main'
+    # Runs on pull_request too so the artifact is validated before merge.
+    # Only the deployment step below is restricted to main, so a PR never
+    # overwrites the published Pages site.
     needs: build
     runs-on: ubuntu-latest
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      - name: Verify Storybook artifact
+        uses: actions/download-artifact@v5
+        with:
+          name: github-pages
+          path: storybook-preview
+
+      - name: Check artifact contents
+        run: |
+          # upload-pages-artifact uploads a single tarball of the static site
+          test -f storybook-preview/artifact.tar
+          tar -tf storybook-preview/artifact.tar > storybook-contents.txt
+          head -20 storybook-contents.txt
+          if ! grep -qE '(^|/)index\.html$' storybook-contents.txt; then
+            echo "::error::Storybook artifact is missing index.html"
+            exit 1
+          fi
+          echo "Storybook artifact verified: $(grep -c . storybook-contents.txt) files, $(du -h storybook-preview/artifact.tar | cut -f1)"
+
       - name: Deploy to GitHub Pages
+        if: github.ref == 'refs/heads/main'
         id: deployment
         uses: actions/deploy-pages@v5
+
+      - name: Report preview build
+        if: github.ref != 'refs/heads/main'
+        run: |
+          {
+            echo "### Storybook artifact validated"
+            echo ""
+            echo "This run built and verified the static Storybook bundle."
+            echo "The GitHub Pages deployment only runs on \`main\`, so this PR does not publish it."
+          } >> "$GITHUB_STEP_SUMMARY"

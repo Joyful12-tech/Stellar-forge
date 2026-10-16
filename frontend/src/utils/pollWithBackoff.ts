@@ -18,6 +18,7 @@ export interface BackoffOptions {
 export function nextBackoffDelay(attempt: number, options: BackoffOptions): number {
   const { initialDelayMs, maxDelayMs, jitterRatio = 0.2 } = options
   const base = Math.min(initialDelayMs * Math.pow(2, attempt), maxDelayMs)
-  const jitter = Math.floor(Math.random() * jitterRatio * base) - Math.floor((jitterRatio / 2) * base)
+  const jitter =
+    Math.floor(Math.random() * jitterRatio * base) - Math.floor((jitterRatio / 2) * base)
   return base + jitter
 }

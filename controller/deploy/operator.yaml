@@ -1,0 +1,60 @@
+# The StellarForge ephemeral testnet operator.
+#
+#   kubectl apply -f controller/deploy/operator.yaml
+#
+# Build and push the image first (see controller/README.md):
+#   docker build -t <registry>/stellar-forge-controller:latest controller
+#
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: stellar-forge-system
+  labels:
+    app.kubernetes.io/name: stellar-forge-controller
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stellar-forge-controller
+  namespace: stellar-forge-system
+  labels:
+    app.kubernetes.io/name: stellar-forge-controller
+spec:
+  replicas: 1
+  # A single controller must not run twice: concurrent reconciles would
+  # race on the CRD install and the finalizer patches.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: stellar-forge-controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: stellar-forge-controller
+    spec:
+      serviceAccountName: stellar-forge-controller
+      containers:
+        - name: controller
+          # Replace with your registry; the controller prints its CRD with
+          # `stellar-forge-controller crd`.
+          image: stellar-forge-controller:latest
+          imagePullPolicy: IfNotPresent
+          args: []
+          env:
+            - name: RUST_LOG
+              value: info
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            capabilities:
+              drop: ["ALL"]
