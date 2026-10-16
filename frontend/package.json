@@ -1,26 +1,24 @@
 {
-  "name": "stellarforge-frontend",
+  "name": "stellar-forge-frontend",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "storybook": "storybook dev -p 6006",
-    "build-storybook": "storybook build",
-    "analyze": "vite-bundle-analyzer dist",
-    "build": "vite build",
-    "prebuild": "npx tsx scripts/generateCSP.ts && npx tsx scripts/generateSitemap.ts",
     "dev": "vite",
-    "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
-    "typecheck": "tsc --noEmit -p tsconfig.json",
-    "format": "prettier --write \"src/**/*.{ts,tsx}\"",
-    "format:check": "prettier --check \"src/**/*.{ts,tsx}\"",
+    "build": "vite build",
     "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
+    "format:check": "prettier --check 'src/**/*.{ts,tsx}'",
+    "format:write": "prettier --write 'src/**/*.{ts,tsx}'",
     "test": "vitest",
     "test:ui": "vitest --ui",
-    "test:coverage": "vitest --coverage",
+    "coverage": "vitest run --coverage",
+    "storybook": "storybook dev -p 6006",
+    "build-storybook": "storybook build",
     "test:e2e": "playwright test",
-    "prepare": "husky",
-    "audit:ci": "npm audit --audit-level=high"
+    "lint-staged": "lint-staged",
+    "prepare": "husky"
   },
   "dependencies": {
     "@sentry/react": "^10.47.0",
@@ -34,14 +32,6 @@
     "react-i18next": "^17.0.0",
     "react-router-dom": "^7.18.4",
     "stellar-sdk": "^13.3.0"
-  },
-  "overrides": {
-    "serialize-javascript": ">=7.0.5",
-    "@rollup/plugin-terser": ">=1.0.0",
-    "vite": "^8.0.7",
-    "stellar-sdk": {
-      "toml": "3.0.0"
-    }
   },
   "devDependencies": {
     "@chromatic-com/storybook": "^3.2.2",
@@ -87,5 +77,16 @@
     "vite-bundle-analyzer": "^1.3.7",
     "vite-plugin-pwa": "1.2.0",
     "vitest": "^4.1.4"
+  },
+  "overrides": {
+    "serialize-javascript": ">=7.0.5",
+    "@rollup/plugin-terser": ">=1.0.0",
+    "vite": "^8.0.7",
+    "stellar-sdk": {
+      "toml": "3.0.0"
+    }
+  },
+  "lint-staged": {
+    "*.{ts,tsx}": ["eslint --fix", "prettier --write"]
   }
 }
