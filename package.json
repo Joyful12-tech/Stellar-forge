@@ -1,6 +1,6 @@
 {
   "name": "stellar-forge",
-  "version": "1.10.3",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "description": "StellarForge - Stellar Token Deployer",
