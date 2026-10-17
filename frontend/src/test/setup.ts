@@ -1,10 +1,10 @@
 // setup for vitest
-import { expect, afterEach } from 'vitest'
+import { afterEach } from 'vitest'
 import { cleanup } from '@testing-library/react'
-import * as matchers from '@testing-library/jest-dom/matchers'
-
-// extends Vitest's expect method with methods from react-testing-library
-expect.extend(matchers)
+// Registers jest-dom matchers (toBeInTheDocument, etc.) and augments Vitest's
+// Assertion type with them - the /matchers subpath alone only provides the
+// standalone function types, not the global expect() augmentation.
+import '@testing-library/jest-dom/vitest'
 
 // runs a cleanup after each test case (e.g. clearing jsdom)
 afterEach(() => {

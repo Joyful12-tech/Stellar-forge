@@ -1,5 +1,7 @@
 # Soroban Contract Development Dockerfile
-FROM rust:1.75-slim
+# Base image pinned by digest (multi-arch index) instead of the mutable
+# rust:1.75-slim tag, so a re-pushed tag cannot silently change the build base.
+FROM rust:1.75-slim@sha256:70c2a016184099262fd7cee46f3d35fec3568c45c62f87e37f7f665f766b1f74
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -7,10 +9,10 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     pkg-config \
     libssl-dev \
-    && rm -rf /var/lib/apt/lists/*
+    && rm --rf /var/lib/apt/lists/*
 
 # Install wasm32 target for Rust
-RUN rustup target add wasm32-unknown-unknown
+RUN rustup target add wasm32v1-none
 
 # Install wasm-opt for optimization
 RUN curl -L https://github.com/WebAssembly/binaryen/releases/download/version_116/binaryen-version_116-x86_64-linux.tar.gz \
@@ -31,14 +33,25 @@ WORKDIR /contracts
 COPY Cargo.toml Cargo.lock ./
 COPY token-factory/Cargo.toml ./token-factory/
 
+# Create a non-root user for the dev/build process
+RUN useradd -m -s /bin/bash builder
+
 # Create dummy source files to cache dependencies
 RUN mkdir -p token-factory/src \
     && echo "fn main() {}" > token-factory/src/lib.rs \
-    && cargo build --target wasm32-unknown-unknown --release \
+    && cargo build --target wasm32v1-none --release \
     && rm -rf token-factory/src
 
 # Copy actual source code
 COPY . .
+
+# Give the non-root user ownership of the source tree and CARGO_HOME so that
+# `cargo build` (run at dev time via the bind-mounted source and the persisted
+# /contracts/target volume) can write its output without root.
+RUN chown -R builder:builder /contracts /usr/local/cargo
+
+# Drop root privileges for the dev/build process
+USER builder
 
 # Default command for interactive development
 CMD ["bash"]

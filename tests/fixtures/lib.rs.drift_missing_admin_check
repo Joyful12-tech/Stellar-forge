@@ -1,0 +1,147 @@
+// DRIFT SCENARIO 2: admin identity check removed from add_to_whitelist.
+// Fixture for: DESTRUCTIVE TEST - missing admin identity check
+//
+// Retargeted from set_metadata in issue #1161: set_metadata is creator-gated,
+// never admin-gated, so "missing admin check in set_metadata" described a
+// guard the real contract does not have. add_to_whitelist is genuinely
+// admin-only, which makes the removal a real drift.
+
+pub fn __constructor(env: Env, admin: Address) -> Result<(), Error> {
+    admin.require_auth();
+    // Initialize state with admin
+    Ok(())
+}
+
+pub fn add_to_whitelist(env: Env, admin: Address, account: Address) -> Result<(), Error> {
+    admin.require_auth();
+    // REMOVED: if state.admin != admin { return Err(Error::Unauthorized); }
+    // ^ DRIFT: signing as any address now passes; the admin identity check is
+    //   gone, so `admin.require_auth()` alone gates an admin-only entrypoint.
+    // Add to whitelist
+    Ok(())
+}
+
+pub fn remove_from_whitelist(env: Env, admin: Address, account: Address) -> Result<(), Error> {
+    admin.require_auth();
+    let state = get_state(&env);
+    if state.admin != admin {
+        return Err(Error::Unauthorized);
+    }
+    // Remove from whitelist
+    Ok(())
+}
+
+pub fn set_whitelist_enabled(env: Env, admin: Address, enabled: bool) -> Result<(), Error> {
+    admin.require_auth();
+    let state = get_state(&env);
+    if state.admin != admin {
+        return Err(Error::Unauthorized);
+    }
+    // Update whitelist enabled flag
+    Ok(())
+}
+
+pub fn is_whitelisted(env: Env, account: Address) -> Result<bool, Error> {
+    // No auth required - public view
+    let state = get_state(&env);
+    Ok(state.whitelist.contains(&account))
+}
+
+pub fn create_token(
+    env: Env,
+    creator: Address,
+    symbol: String,
+    name: String,
+    initial_supply: i128,
+) -> Result<Address, Error> {
+    creator.require_auth();
+    let state = get_state(&env);
+    
+    // Whitelist gate (conditional)
+    if state.whitelist_enabled {
+        Self::require_whitelisted(&env, &state, &creator)?;
+    }
+    
+    // Create token logic
+    Ok(Address::generate(&env))
+}
+
+pub fn create_tokens_batch(
+    env: Env,
+    creator: Address,
+    tokens: Vec<TokenDefinition>,
+) -> Result<Vec<Address>, Error> {
+    creator.require_auth();
+    let state = get_state(&env);
+    
+    // Whitelist gate (conditional)
+    if state.whitelist_enabled {
+        Self::require_whitelisted(&env, &state, &creator)?;
+    }
+    
+    // Batch create logic
+    Ok(vec![])
+}
+
+// Creator-authorized, NOT factory-admin gated (issue #1161).
+//
+// The caller parameter is conventionally named `admin` — it is the *token's*
+// admin, i.e. its creator — and the guard compares it against the creator
+// stored under the token's `owner` key. `state.admin` is never consulted, so
+// the factory admin key grants no metadata authority. Mirrors
+// contracts/token-factory/src/lib.rs `set_metadata`.
+pub fn set_metadata(
+    env: Env,
+    token_address: Address,
+    admin: Address,
+    metadata: Metadata,
+) -> Result<(), Error> {
+    admin.require_auth();
+
+    let creator: Address = get_token_owner(&env, &token_address)?;
+    if creator != admin {
+        return Err(Error::Unauthorized);
+    }
+
+    // Update metadata
+    Ok(())
+}
+
+// Private helper functions
+fn get_token_owner(env: &Env, token_address: &Address) -> Result<Address, Error> {
+    // Stands in for `migrate_addr_keyed(&env, &(&token_address, symbol_short!("owner")))`
+    Err(Error::TokenNotFound)
+}
+
+fn require_whitelisted(env: &Env, state: &State, creator: &Address) -> Result<(), Error> {
+    if !state.whitelist.contains(creator) {
+        return Err(Error::NotWhitelisted);
+    }
+    Ok(())
+}
+
+struct State {
+    admin: Address,
+    whitelist: Vec<Address>,
+    whitelist_enabled: bool,
+}
+
+#[derive(Clone)]
+struct Metadata {
+    key: String,
+    value: String,
+}
+
+#[derive(Clone)]
+struct TokenDefinition {
+    symbol: String,
+    name: String,
+    initial_supply: i128,
+}
+
+#[derive(Debug)]
+pub enum Error {
+    Unauthorized,
+    NotWhitelisted,
+    TokenNotFound,
+}

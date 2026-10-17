@@ -31,7 +31,7 @@ jobs:
         run: cargo build --target wasm32v1-none --release
         working-directory: contracts
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 20
 
@@ -70,6 +70,48 @@ jobs:
         run: cargo fmt -- --check
         working-directory: contracts
 
+  # Both scripts existed but were wired into nothing — no workflow, no npm
+  # script, no git hook — so the drift they exist to catch (issues #946 and
+  # #1014) was only ever caught by someone remembering to run them by hand.
+  # They are pure bash/awk over the sources, so they need no toolchain.
+  drift-checks:
+    name: Contract/Frontend Drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: ABI documentation drift (docs/contract-abi.md vs lib.rs)
+        run: ./scripts/check-abi-doc-drift.sh
+
+      - name: Event topic drift (lib.rs vs CONTRACT_TOPIC_MAP)
+        run: ./scripts/check-event-topic-drift.sh
+
+      - name: Frontend/contract validation bounds drift (validation.ts vs lib.rs)
+        run: ./scripts/check-validation-drift.sh
+      
+      - name: Stellar impl contract call signature validation (issue #5 fix)
+        run: node scripts/check-stellar-impl-abi.mjs
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 20
+
+      - name: Spec stubs check (.kiro/specs/*)
+        run: node scripts/check-kiro-specs.mjs
+
+      # Vercel schedules cron jobs *only* from a `crons` array in the deployed
+      # project's vercel.json. Issue #1090: the entrypoint, the design doc and
+      # the spec all claimed the indexer cron existed, no config file ever
+      # contained one, and the app kept working (RPC fallback) so nothing
+      # surfaced it. Fail the build instead.
+      - name: Vercel cron configuration (issue #1090)
+        run: node scripts/check-vercel-cron.mjs
+
+      # scripts/*.test.mjs existed but no workflow ran them — the same rot M3
+      # found in the API tests. Plain node:test, so no toolchain is needed.
+      - name: Build-script tests
+        run: npm run test:scripts
+
   frontend:
     name: Frontend
     runs-on: ubuntu-latest
@@ -79,9 +121,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v6
+      # Node 22, not 20, specifically for this job. jsdom 30 requires
+      # ^22.22.2 || ^24.15.0 || >=26.0.0. On Node 20 its bundled undici throws
+      # "webidl.util.markAsUncloneable is not a function" (that helper is a
+      # Node >=22.10 API) while loading jsdom/lib/api.js, so every one of the
+      # 67 test files fails to start — the run reports "no tests, 67 errors"
+      # rather than a test failure. engine-strict is off, so `npm ci` only
+      # warns and the break surfaces at runtime.
+      - uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
@@ -96,6 +145,15 @@ jobs:
       - name: i18n Parity Check
         run: node scripts/check-i18n-parity.mjs
 
+      - name: Analytics Bypass Check
+        run: npm run check:analytics-bypass
+
+      # Must run before Build: `npm run build` fires the prebuild generator,
+      # which rewrites the deployment configs in place and would mask drift
+      # between policy.ts and the committed vercel.json / _headers / index.html.
+      - name: CSP Config Drift Check
+        run: npm run check:csp
+
       - name: Typecheck
         run: npm run typecheck
 
@@ -104,6 +162,75 @@ jobs:
 
       - name: Build
         run: npm run build
+
+  api:
+    name: API (serverless functions)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm run test:api
+
+  contract-benchmarks:
+    name: Contract Resource Benchmarks
+    runs-on: ubuntu-latest
+    # Non-blocking: informational only until baselines stabilize.
+    # Set BENCH_BLOCKING=1 in the step env below to promote to blocking.
+    continue-on-error: true
+    # Only run on PRs that touch contract sources, or on direct pushes to main.
+    if: >
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request' &&
+       contains(join(github.event.pull_request.labels.*.name, ','), 'contracts'))
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: contracts
+
+      - name: Run benchmark tests
+        id: bench
+        run: |
+          cargo test --features bench bench_ -- --nocapture 2>/dev/null | tee /tmp/bench_raw.txt
+        working-directory: contracts/token-factory
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Compare against baseline
+        run: |
+          python3 scripts/check_benchmarks.py \
+            --baseline contracts/token-factory/bench_snapshots/baseline.json \
+            < /tmp/bench_raw.txt
+        env:
+          # Set to "1" to make regressions fail the job (promotes to blocking).
+          BENCH_BLOCKING: "0"
+          BENCH_THRESHOLD_PCT: "10"
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-results-${{ github.sha }}
+          path: /tmp/bench_raw.txt
+          retention-days: 30
 
   e2e:
     name: End-to-End Tests
@@ -115,7 +242,7 @@ jobs:
       - name: Start Local Stellar Network
         run: docker compose -f docker-compose.e2e.yml up -d
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 20
           cache: npm
@@ -148,8 +275,6 @@ jobs:
           # placeholder — no factory contract is deployed onto the local network in this job
           VITE_FACTORY_CONTRACT_ID: CCN6L3B2R6G2H5J4J4J4J4J4J4J4J4J4J4J4J4J4J4J4J4J4J4
           VITE_TOKEN_WASM_HASH: "0000000000000000000000000000000000000000000000000000000000000000"
-          VITE_IPFS_API_KEY: mock-key
-          VITE_IPFS_API_SECRET: mock-secret
 
       - name: Run E2E tests
         run: npm run test:e2e
@@ -159,8 +284,6 @@ jobs:
           # placeholder — no factory contract is deployed onto the local network in this job
           VITE_FACTORY_CONTRACT_ID: CCN6L3B2R6G2H5J4J4J4J4J4J4J4J4J4J4J4J4J4J4J4J4J4J4
           VITE_TOKEN_WASM_HASH: "0000000000000000000000000000000000000000000000000000000000000000"
-          VITE_IPFS_API_KEY: mock-key
-          VITE_IPFS_API_SECRET: mock-secret
 
       - name: Stop Local Stellar Network
         if: always()

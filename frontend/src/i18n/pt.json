@@ -77,7 +77,10 @@
     "walletNotConnected": "A carteira não está conectada",
     "validationFailed": "Corrija os erros no formulário",
     "submitError": "Falha ao enviar formulário",
-    "deployedSuccessfully": "implantado com sucesso!"
+    "deployedSuccessfully": "implantado com sucesso!",
+    "maxSupplyLabel": "Fornecimento máximo (opcional)",
+    "maxSupplyPlaceholder": "Deixe vazio para ilimitado",
+    "maxSupplyHelp": "Um limite rígido do fornecimento total. Depois de definido não pode ser alterado, e a emissão acima dele é rejeitada."
   },
   "mintForm": {
     "tokenAddress": "Endereço do Token",

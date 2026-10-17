@@ -1,0 +1,65 @@
+# Token Factory Contract ABI
+
+## `__constructor(...)`
+
+Initializes the token factory contract with an admin account.
+
+**Authorization:** Admin must authorize deployment
+
+---
+
+## `add_to_whitelist(...)`
+
+Adds an account to the whitelist (admin-only).
+
+**Authorization:** Admin-only. Requires admin identity verification.
+
+---
+
+## `remove_from_whitelist(...)`
+
+Removes an account from the whitelist (admin-only).
+
+**Authorization:** Admin-only. Requires admin identity verification.
+
+---
+
+## `set_whitelist_enabled(...)`
+
+Enables or disables the whitelist gate (admin-only).
+
+**Authorization:** Admin-only. Requires admin identity verification.
+
+---
+
+## `is_whitelisted(...)`
+
+Checks if an account is whitelisted (public view, no auth required).
+
+**Authorization:** Public view. No authentication required.
+
+---
+
+## `create_token(...)`
+
+Creates a new token. If whitelist is enabled, creator must be whitelisted.
+
+**Authorization:** Creator must authorize. Whitelisted if enabled.
+
+---
+
+## `create_tokens_batch(...)`
+
+Creates multiple tokens in a batch. If whitelist is enabled, creator must be whitelisted.
+
+**Authorization:** Creator must authorize. Whitelisted if enabled.
+
+---
+
+## `set_metadata(...)`
+
+Updates token metadata. Admin-only. Creator can update their own token's metadata.
+
+**Authorization:** Admin-only. Requires admin identity verification. Creator metadata mutable by creator.
+
+---

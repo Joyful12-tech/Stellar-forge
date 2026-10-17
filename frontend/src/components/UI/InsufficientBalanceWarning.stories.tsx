@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from '@storybook/react'
-import { fn } from '@storybook/test'
+import { fn } from 'storybook/test'
 import { InsufficientBalanceWarning } from './InsufficientBalanceWarning'
 import { WalletContext } from '../../context/WalletContext'
 import { ToastContext } from '../../context/ToastContext'

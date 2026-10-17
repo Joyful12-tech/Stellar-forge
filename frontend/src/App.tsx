@@ -19,7 +19,7 @@ import { NetworkSwitcher } from './components/NetworkSwitcher'
 import { LanguageSwitcher } from './components/LanguageSwitcher'
 import { FundbotButton } from './components/FundbotButton'
 import { useWallet } from './hooks/useWallet'
-import { truncateAddress, formatXLM } from './utils/formatting'
+import { truncateAddress } from './utils/formatting'
 import { NavBar } from './components/NavBar'
 import { Home } from './components/Home'
 import { CreateToken } from './components/CreateToken'
@@ -32,6 +32,7 @@ import { NotFound } from './components/NotFound'
 import { TransactionHistory } from './components/TransactionHistory'
 import { AnalyticsOptOut } from './components/AnalyticsOptOut'
 import { NetworkMismatchBanner } from './components/NetworkBadge'
+import { WasmHashMismatchBanner } from './components/WasmHashMismatchBanner'
 import { FAQ } from './components/FAQ'
 
 const TokenDashboard = React.lazy(() =>
@@ -47,6 +48,7 @@ import { isFactoryConfigured } from './config/env'
 import ErrorBoundary from './components/ErrorBoundary'
 import { TosProvider } from './context/TosContext'
 import { ThemeProvider, useTheme } from './context/ThemeContext'
+import { STELLAR_CONFIG } from './config/stellar'
 
 const ProtectedRoute: React.FC<{ children: React.ReactElement }> = ({ children }) => {
   const { wallet } = useWallet()
@@ -231,7 +233,9 @@ function AppContent() {
                       {truncateAddress(wallet.address)}
                     </span>
                     {wallet.balance && (
-                      <span className="shrink-0">{formatXLM(wallet.balance)}</span>
+                      // wallet.balance is Horizon's decimal XLM string, not stroops —
+                      // formatXLM would throw (BigInt on a decimal) and crash the app.
+                      <span className="shrink-0">{wallet.balance} XLM</span>
                     )}
                   </div>
                 )}
@@ -249,6 +253,8 @@ function AppContent() {
         {showOnboarding && <OnboardingModal forceOpen onClose={() => setShowOnboarding(false)} />}
 
         <NetworkMismatchBanner />
+
+        <WasmHashMismatchBanner />
 
         {!isFactoryConfigured() && (
           <div
@@ -421,7 +427,12 @@ function AppContent() {
           </div>
         </div>
 
-        <footer className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 mt-4 border-t border-gray-200 dark:border-slate-700 flex justify-center">
+        <footer className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 mt-4 border-t border-gray-200 dark:border-slate-700 flex flex-col items-center gap-2">
+          <div className="text-xs text-gray-500 dark:text-gray-400 text-center">
+            Network: {STELLAR_CONFIG.network} | Contract:{' '}
+            {STELLAR_CONFIG.factoryContractId?.slice(0, 8) || 'N/A'}…
+            {STELLAR_CONFIG.factoryContractId?.slice(-6) || ''}
+          </div>
           <AnalyticsOptOut />
         </footer>
 

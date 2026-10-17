@@ -1,6 +1,7 @@
 import React from 'react'
 import { useNetwork } from '../context/NetworkContext'
 import type { Network } from '../context/NetworkContext'
+import { networkLabel } from '../config/stellar'
 
 const BADGE_COLORS: Record<Network, string> = {
   testnet: 'bg-yellow-100 text-yellow-800 border-yellow-300',
@@ -14,12 +15,6 @@ const DOT_COLORS: Record<Network, string> = {
   standalone: 'bg-purple-500',
 }
 
-const LABELS: Record<Network, string> = {
-  testnet: 'Testnet',
-  mainnet: 'Mainnet',
-  standalone: 'Standalone',
-}
-
 /**
  * NetworkBadge — read-only pill showing the active app network.
  * Reads Freighter's network via the mismatch hook in NetworkContext.
@@ -30,10 +25,10 @@ export const NetworkBadge: React.FC = () => {
   return (
     <span
       className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-semibold select-none ${BADGE_COLORS[network]}`}
-      aria-label={`Active network: ${LABELS[network]}`}
+      aria-label={`Active network: ${networkLabel(network)}`}
     >
       <span className={`h-1.5 w-1.5 rounded-full ${DOT_COLORS[network]}`} aria-hidden="true" />
-      {LABELS[network]}
+      {networkLabel(network)}
     </span>
   )
 }
@@ -47,7 +42,7 @@ export const NetworkMismatchBanner: React.FC = () => {
 
   if (!mismatch.isMismatch) return null
 
-  const expected = network === 'mainnet' ? 'Mainnet' : 'Testnet'
+  const expected = networkLabel(network)
   const freighterLabel = mismatch.freighterNetwork ?? 'a different network'
 
   return (

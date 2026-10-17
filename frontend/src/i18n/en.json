@@ -77,7 +77,10 @@
     "walletNotConnected": "Wallet is not connected",
     "validationFailed": "Please fix the errors in the form",
     "submitError": "Failed to submit form",
-    "deployedSuccessfully": "deployed successfully!"
+    "deployedSuccessfully": "deployed successfully!",
+    "maxSupplyLabel": "Max Supply (Optional)",
+    "maxSupplyPlaceholder": "Leave empty for unlimited",
+    "maxSupplyHelp": "A hard cap on total supply. Once set it cannot be changed, and minting beyond it is rejected."
   },
   "mintForm": {
     "tokenAddress": "Token Address",

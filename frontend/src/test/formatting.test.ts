@@ -9,6 +9,7 @@ import {
   xlmToStroops,
   stellarExplorerUrl,
   ipfsToGatewayUrl,
+  TOKEN_IMAGE_PLACEHOLDER,
 } from '../utils/formatting'
 
 describe('ipfsToGatewayUrl', () => {
@@ -24,9 +25,35 @@ describe('ipfsToGatewayUrl', () => {
     )
   })
 
-  it('returns non-IPFS URIs unchanged', () => {
-    expect(ipfsToGatewayUrl('https://example.com/metadata.json')).toBe(
-      'https://example.com/metadata.json',
+  // Previously this asserted non-IPFS URIs were "returned unchanged". That
+  // passthrough was the SSRF/tracking-beacon hole #984 set out to close: token
+  // metadata is attacker-controlled, so an arbitrary URL reaching an <img src>
+  // makes every viewer's browser call out to the token creator's server.
+  it('refuses to pass an arbitrary http(s) URL through', () => {
+    expect(ipfsToGatewayUrl('https://evil.example.com/pixel.png')).toBe(TOKEN_IMAGE_PLACEHOLDER)
+  })
+
+  it.each([
+    ['a javascript: URI', 'javascript:alert(1)'],
+    ['a data: URI', 'data:text/html,<script>alert(1)</script>'],
+    ['a protocol-relative URL', '//evil.example.com/pixel.png'],
+    ['an empty string', ''],
+    ['an ipfs URI with no CID', 'ipfs://'],
+    ['an ipfs URI with path traversal', 'ipfs://../../etc/passwd'],
+    ['an ipfs URI smuggling a host', 'ipfs://evil.example.com/../x'],
+  ])('resolves %s to the placeholder', (_label, uri) => {
+    expect(ipfsToGatewayUrl(uri)).toBe(TOKEN_IMAGE_PLACEHOLDER)
+  })
+
+  it('never returns a URL outside the configured gateway origin', () => {
+    fc.assert(
+      fc.property(fc.string(), (uri) => {
+        const result = ipfsToGatewayUrl(uri)
+        return (
+          result === TOKEN_IMAGE_PLACEHOLDER ||
+          result.startsWith('https://gateway.pinata.cloud/ipfs/')
+        )
+      }),
     )
   })
 })

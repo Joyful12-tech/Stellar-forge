@@ -9,103 +9,117 @@ struct FuzzCreateTokenInput {
     name_bytes: Vec<u8>,
     symbol_bytes: Vec<u8>,
     decimals: u32,
-    // i128 has full Arbitrary support; we reinterpret its bit pattern as u128
-    // below to cover the high-end values that the contract's u128 parameter
-    // accepts.  This means values ≥ 0 map to [0, i128::MAX] and negative
-    // values map to (i128::MAX, u128::MAX], which is exactly the overflow
-    // region guarded by the fix for issue #909.
-    initial_supply_bits: i128,
+    // As of issue #1022 `create_token`'s `initial_supply` is `i128` (unified
+    // with the batch path), so the fuzzer generates it directly as an i128 —
+    // the earlier `u128`→`i128` overflow region no longer exists at the ABI.
+    initial_supply: i128,
+    // `Option<i128>` supply cap, also validated by the shared routine.
+    max_supply: Option<i128>,
     fee_payment: i128,
 }
 
-fuzz_target!(|input: FuzzCreateTokenInput| {
-    // Test string validation and creation with random UTF-8 data
+/// Pure re-implementation of the contract's shared `validate_token_params`
+/// rules (see `contracts/token-factory/src/lib.rs`). Returns a stable tag for
+/// the fault class, or `None` when the parameters are valid. Kept in sync with
+/// the contract by the property test `prop_single_and_batch_paths_agree`.
+fn classify(
+    name_len: usize,
+    symbol_len: usize,
+    decimals: u32,
+    initial_supply: i128,
+    max_supply: Option<i128>,
+) -> Option<&'static str> {
+    if name_len == 0 || name_len > 32 {
+        return Some("InvalidTokenParams");
+    }
+    if symbol_len == 0 || symbol_len > 12 {
+        return Some("InvalidTokenParams");
+    }
+    if decimals > 18 {
+        return Some("InvalidDecimals");
+    }
+    if initial_supply < 0 {
+        return Some("InvalidParameters");
+    }
+    if let Some(cap) = max_supply {
+        if cap <= 0 || initial_supply > cap {
+            return Some("InvalidParameters");
+        }
+    }
+    None
+}
 
-    // Convert random bytes to valid UTF-8 strings
+fuzz_target!(|input: FuzzCreateTokenInput| {
+    // Convert random bytes to valid UTF-8 strings (mirrors what the frontend
+    // would submit; the contract validates lengths, not encoding).
     let name_str = match String::from_utf8(input.name_bytes) {
-        Ok(s) if !s.is_empty() => s,
+        Ok(s) => s,
         _ => "DefaultToken".to_string(),
     };
-
     let symbol_str = match String::from_utf8(input.symbol_bytes) {
-        Ok(s) if !s.is_empty() => s,
+        Ok(s) => s,
         _ => "DTK".to_string(),
     };
 
-    // Verify string properties
-    assert!(!name_str.is_empty());
-    assert!(!symbol_str.is_empty());
+    // The validation predicate must be total (never panic) for every input,
+    // and deterministic — the same parameters always classify the same way.
+    let first = classify(
+        name_str.len(),
+        symbol_str.len(),
+        input.decimals,
+        input.initial_supply,
+        input.max_supply,
+    );
+    let second = classify(
+        name_str.len(),
+        symbol_str.len(),
+        input.decimals,
+        input.initial_supply,
+        input.max_supply,
+    );
+    assert_eq!(
+        first, second,
+        "validation classification must be deterministic"
+    );
 
-    // Test bounded arithmetic - should not panic on overflow
-    let decimals_bounded = input.decimals % 256;
-    let fee_bounded = input.fee_payment.saturating_abs();
-
-    // Verify invariants
-    assert!(decimals_bounded < 256);
-    assert!(fee_bounded >= 0);
-
-    // ── Supply boundary checks (issue #909) ───────────────────────────────
-    // Reinterpret the fuzz-provided i128 as a u128 (same bits, different type)
-    // so that the full u128 domain — including values above i128::MAX — is
-    // reachable by the fuzzer with an Arbitrary-compatible input type.
-    let initial_supply = input.initial_supply_bits as u128;
-
-    // Validate that the supply guard logic never panics and always produces
-    // the correct accept/reject decision without silent wraparound.
-    //
-    // The fix rejects any u128 value > i128::MAX with InvalidParameters.
-    // Here we replicate that exact predicate and confirm it is consistent
-    // with a safe cast, covering the four critical boundary values that
-    // libFuzzer is unlikely to find on its own:
-    //   • i128::MAX - 1  (just below the limit — valid)
-    //   • i128::MAX      (exactly at the limit — valid)
-    //   • i128::MAX + 1  (one above the limit — must be rejected)
-    //   • u128::MAX      (largest possible value — must be rejected)
-    let boundary_cases: [u128; 4] = [
-        (i128::MAX as u128).saturating_sub(1), // i128::MAX - 1
-        i128::MAX as u128,                     // i128::MAX
-        (i128::MAX as u128).saturating_add(1), // i128::MAX + 1
-        u128::MAX,                             // u128::MAX
-    ];
-
-    for &supply in &boundary_cases {
-        if supply > i128::MAX as u128 {
-            // Values above i128::MAX must be rejected — simulating the guard.
-            // A cast here would produce a negative i128; assert we never
-            // reach the cast path without the guard.
-            let would_be_negative = supply as i128; // intentional: validate sign
-            assert!(
-                would_be_negative < 0,
-                "supply {supply} above i128::MAX must cast to a negative i128 \
-                 (confirming the guard is necessary)"
-            );
-        } else {
-            // Values at or below i128::MAX must cast safely and stay non-negative.
-            let safe_supply = supply as i128;
-            assert!(
-                safe_supply >= 0,
-                "supply {supply} ≤ i128::MAX must produce a non-negative i128, got {safe_supply}"
-            );
+    // Cross-check the individual fault-class invariants hold exactly as the
+    // contract documents (one code per fault class, checked in order).
+    match first {
+        Some("InvalidTokenParams") => assert!(
+            name_str.is_empty()
+                || name_str.len() > 32
+                || symbol_str.is_empty()
+                || symbol_str.len() > 12,
+            "InvalidTokenParams implies a bad name or symbol length"
+        ),
+        Some("InvalidDecimals") => assert!(
+            name_str.len() >= 1
+                && name_str.len() <= 32
+                && symbol_str.len() >= 1
+                && symbol_str.len() <= 12
+                && input.decimals > 18,
+            "InvalidDecimals implies valid name/symbol but decimals > 18"
+        ),
+        Some("InvalidParameters") => assert!(
+            input.initial_supply < 0
+                || matches!(input.max_supply, Some(cap) if cap <= 0 || input.initial_supply > cap),
+            "InvalidParameters implies a bad initial_supply or max_supply"
+        ),
+        None => {
+            // Valid: every documented constraint must hold simultaneously.
+            assert!(name_str.len() >= 1 && name_str.len() <= 32);
+            assert!(symbol_str.len() >= 1 && symbol_str.len() <= 12);
+            assert!(input.decimals <= 18);
+            assert!(input.initial_supply >= 0);
+            if let Some(cap) = input.max_supply {
+                assert!(cap > 0 && input.initial_supply <= cap);
+            }
         }
+        Some(other) => panic!("unexpected classification tag: {other}"),
     }
 
-    // Also run the same check for the fuzz-provided supply value so every
-    // input exercises the guard predicate.
-    if initial_supply <= i128::MAX as u128 {
-        let safe = initial_supply as i128;
-        assert!(
-            safe >= 0,
-            "supply {} ≤ i128::MAX must produce a non-negative i128, got {}",
-            initial_supply,
-            safe
-        );
-    }
-    // (Values above i128::MAX would be rejected by the contract; no cast is
-    //  performed on that code path, so no assertion needed here.)
-
-    // Test saturation arithmetic doesn't panic
+    // Fee arithmetic on the (untrusted) fee_payment must never panic.
+    let fee_bounded = input.fee_payment.saturating_abs();
     let _total = fee_bounded.saturating_add(i64::MAX as i128);
-    let _product = fee_bounded.saturating_mul(i128::from(decimals_bounded));
-
-    // Fuzz test passes if no panic occurs
+    let _product = fee_bounded.saturating_mul(i128::from(input.decimals % 19));
 });

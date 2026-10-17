@@ -1,0 +1,143 @@
+// DRIFT SCENARIO 3: set_metadata gated on the factory admin instead of the
+// token's creator — the mischaracterization from issue #1161, in code form.
+// Fixture for: DESTRUCTIVE TEST - creator authority replaced by admin authority
+
+pub fn __constructor(env: Env, admin: Address) -> Result<(), Error> {
+    admin.require_auth();
+    // Initialize state with admin
+    Ok(())
+}
+
+pub fn add_to_whitelist(env: Env, admin: Address, account: Address) -> Result<(), Error> {
+    admin.require_auth();
+    let state = get_state(&env);
+    if state.admin != admin {
+        return Err(Error::Unauthorized);
+    }
+    // Add to whitelist
+    Ok(())
+}
+
+pub fn remove_from_whitelist(env: Env, admin: Address, account: Address) -> Result<(), Error> {
+    admin.require_auth();
+    let state = get_state(&env);
+    if state.admin != admin {
+        return Err(Error::Unauthorized);
+    }
+    // Remove from whitelist
+    Ok(())
+}
+
+pub fn set_whitelist_enabled(env: Env, admin: Address, enabled: bool) -> Result<(), Error> {
+    admin.require_auth();
+    let state = get_state(&env);
+    if state.admin != admin {
+        return Err(Error::Unauthorized);
+    }
+    // Update whitelist enabled flag
+    Ok(())
+}
+
+pub fn is_whitelisted(env: Env, account: Address) -> Result<bool, Error> {
+    // No auth required - public view
+    let state = get_state(&env);
+    Ok(state.whitelist.contains(&account))
+}
+
+pub fn create_token(
+    env: Env,
+    creator: Address,
+    symbol: String,
+    name: String,
+    initial_supply: i128,
+) -> Result<Address, Error> {
+    creator.require_auth();
+    let state = get_state(&env);
+    
+    // Whitelist gate (conditional)
+    if state.whitelist_enabled {
+        Self::require_whitelisted(&env, &state, &creator)?;
+    }
+    
+    // Create token logic
+    Ok(Address::generate(&env))
+}
+
+pub fn create_tokens_batch(
+    env: Env,
+    creator: Address,
+    tokens: Vec<TokenDefinition>,
+) -> Result<Vec<Address>, Error> {
+    creator.require_auth();
+    let state = get_state(&env);
+    
+    // Whitelist gate (conditional)
+    if state.whitelist_enabled {
+        Self::require_whitelisted(&env, &state, &creator)?;
+    }
+    
+    // Batch create logic
+    Ok(vec![])
+}
+
+// DRIFT: set_metadata re-gated on the FACTORY admin (issue #1161).
+//
+// The per-token creator check has been swapped for a `state.admin` check,
+// which would hand every token's metadata to the factory admin key. This is
+// the exact claim SECURITY.md and ADR-009 used to make; the checker must
+// reject it.
+pub fn set_metadata(
+    env: Env,
+    token_address: Address,
+    admin: Address,
+    metadata: Metadata,
+) -> Result<(), Error> {
+    admin.require_auth();
+
+    let state = get_state(&env);
+    if state.admin != admin {
+        return Err(Error::Unauthorized);
+    }
+
+    // Update metadata
+    Ok(())
+}
+
+// Private helper functions
+fn get_token_owner(env: &Env, token_address: &Address) -> Result<Address, Error> {
+    // Stands in for `migrate_addr_keyed(&env, &(&token_address, symbol_short!("owner")))`
+    Err(Error::TokenNotFound)
+}
+
+fn require_whitelisted(env: &Env, state: &State, creator: &Address) -> Result<(), Error> {
+    if !state.whitelist.contains(creator) {
+        return Err(Error::NotWhitelisted);
+    }
+    Ok(())
+}
+
+struct State {
+    admin: Address,
+    whitelist: Vec<Address>,
+    whitelist_enabled: bool,
+}
+
+#[derive(Clone)]
+struct Metadata {
+    key: String,
+    value: String,
+}
+
+#[derive(Clone)]
+struct TokenDefinition {
+    symbol: String,
+    name: String,
+    initial_supply: i128,
+}
+
+#[derive(Debug)]
+pub enum Error {
+    Unauthorized,
+    NotWhitelisted,
+    TokenNotFound,
+}

@@ -1,0 +1,151 @@
+name: Validate Access-Control Documentation Drift
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'contracts/**'
+      - 'docs/**'
+      - 'SECURITY.md'
+      - '.github/workflows/**'
+      - 'scripts/check-access-control-docs-drift.sh'
+  push:
+    branches:
+      - main
+    paths:
+      - 'contracts/**'
+      - 'docs/**'
+      - 'SECURITY.md'
+      - '.github/workflows/**'
+      - 'scripts/check-access-control-docs-drift.sh'
+  workflow_dispatch:
+
+jobs:
+  check-access-control-drift:
+    name: Access-Control Drift Check
+    runs-on: ubuntu-latest
+    
+    permissions:
+      contents: read
+      pull-requests: write
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'npm'
+      
+      - name: Make script executable
+        run: chmod +x scripts/check-access-control-docs-drift.sh
+      
+      - name: Run access-control drift check
+        id: drift_check
+        shell: bash
+        run: |
+          set +e
+          ./scripts/check-access-control-docs-drift.sh
+          EXIT_CODE=$?
+          set -e
+          echo "drift_check_exit_code=${EXIT_CODE}" >> "$GITHUB_OUTPUT"
+          if [[ "${EXIT_CODE}" == "1" ]]; then
+            echo "❌ Critical drift detected. PR blocked until resolved."
+            exit 1
+          elif [[ "${EXIT_CODE}" == "2" ]]; then
+            echo "⚠️ Warnings detected. Review documentation."
+            exit 0
+          else
+            echo "✅ No drift detected."
+            exit 0
+          fi
+        continue-on-error: true
+      
+      - name: Report results
+        if: always()
+        shell: bash
+        run: |
+          EXIT_CODE="${{ steps.drift_check.outputs.drift_check_exit_code }}"
+          echo "Exit code: ${EXIT_CODE}"
+
+          if [[ -z "${EXIT_CODE}" ]]; then
+            echo "❌ No exit code was captured from the drift check."
+            exit 1
+          fi
+
+          if [[ "${EXIT_CODE}" == "1" ]]; then
+            echo "❌ Critical drift detected. PR blocked until resolved."
+            exit 1
+          elif [[ "${EXIT_CODE}" == "2" ]]; then
+            echo "⚠️ Warnings detected. Review documentation."
+          else
+            echo "✅ No drift detected."
+          fi
+      
+      - name: Comment on PR (if issues found)
+        if: failure() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          # The body is assembled from an array rather than a multi-line
+          # template literal. A template literal has to keep its content at
+          # column 0 to avoid indenting the rendered markdown, but column 0
+          # terminates this `script: |` block scalar — YAML then read
+          # "- **Actual** ..." as a sequence item and treated the "*" as an
+          # alias, so the whole workflow failed to parse and never ran once.
+          script: |
+            const repo = context.repo.owner + '/' + context.repo.repo;
+            const body = [
+              '## ⚠️ Access-Control Documentation Drift Detected',
+              '',
+              'The changes to `contracts/token-factory/src/lib.rs` introduce a divergence between:',
+              '- **Actual** access-control patterns in the code',
+              '- **Documented** authorization claims in `docs/contract-abi.md` and `SECURITY.md`',
+              '',
+              '### 🔍 How to fix',
+              '',
+              '1. Review the output of the **Access-Control Drift Check** step above',
+              '2. Either:',
+              '   - **Update lib.rs** if the documentation is correct, or',
+              '   - **Update documentation** if the code implementation is correct',
+              '3. Push a new commit to this PR',
+              '',
+              '### 📚 References',
+              '',
+              '- Issue: [#1112 - Access-Control Documentation Drift Check](https://github.com/' + repo + '/issues/1112)',
+              '- Script: [`scripts/check-access-control-docs-drift.sh`](https://github.com/' + repo + '/blob/main/scripts/check-access-control-docs-drift.sh)',
+              '- Documentation: [`docs/contract-abi.md`](https://github.com/' + repo + '/blob/main/docs/contract-abi.md)',
+              '',
+              '---',
+              '*This is an automated check. For questions, see ADR-009 in the docs folder.*',
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body,
+            });
+
+  # Optional: Run alongside other checks
+  call-other-checks:
+    name: Trigger Related Checks
+    needs: check-access-control-drift
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Log results
+        run: |
+          echo "Access-Control Drift Check: ${{ needs.check-access-control-drift.result }}"
+          
+          if [[ "${{ needs.check-access-control-drift.result }}" == "failure" ]]; then
+            echo "❌ Workflow failed due to drift detection"
+            exit 1
+          else
+            echo "✅ Workflow completed successfully"
+          fi

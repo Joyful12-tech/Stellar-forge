@@ -11,8 +11,17 @@ RUN npm ci
 # Copy source code
 COPY . .
 
+# Run the dev server as the pre-existing non-root 'node' user.
+# node_modules is bind-mounted from an anonymous volume at runtime, so we
+# make it owned by 'node' here; Vite writes its dev cache (node_modules/.vite)
+# there, which keeps hot reload working for a non-root user.
+RUN chown -R node:node /app
+
 # Expose port for Vite dev server
 EXPOSE 5173
+
+# Drop root privileges for the dev server process
+USER node
 
 # Start development server
 CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0"]

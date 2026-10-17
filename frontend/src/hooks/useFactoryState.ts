@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
+import { StrKey } from 'stellar-sdk'
 import { STELLAR_CONFIG } from '../config/stellar'
 import type { FactoryState } from '../types'
 
@@ -73,7 +74,13 @@ async function decodeFactoryState(scVal: unknown): Promise<FactoryState> {
     if (!v) throw new Error(`Missing field: ${key}`)
     const addr = v.address()
     if (addr.switch() === xdr.ScAddressType.scAddressTypeAccount()) {
-      return addr.accountId().publicKey().toString()
+      // BUG FIX: `accountId()` returns an XDR `PublicKey` union — it has no
+      // `.publicKey()` method (that was throwing a TypeError at runtime any
+      // time an account-type address, e.g. a real admin key, was decoded).
+      // `.ed25519()` gets the raw key bytes; StrKey re-encodes them as the
+      // standard G... address, matching the pattern already used correctly
+      // in services/stellar-impl.ts's scValToString().
+      return StrKey.encodeEd25519PublicKey(addr.accountId().ed25519())
     }
     return [...new Uint8Array(addr.contractId() as ArrayBuffer)]
       .map((b) => b.toString(16).padStart(2, '0'))
@@ -100,6 +107,19 @@ async function decodeFactoryState(scVal: unknown): Promise<FactoryState> {
     return v.b() as boolean
   }
 
+  // BytesN<32> → lowercase hex. Returns undefined rather than throwing so a
+  // factory deployed with an older state schema still decodes; the WASM-hash
+  // verification hook treats a missing value as "cannot verify", not "drift".
+  function getBytesHex(key: string): string | undefined {
+    const v = map.get(key)
+    if (!v) return undefined
+    try {
+      return [...new Uint8Array(v.bytes())].map((b) => b.toString(16).padStart(2, '0')).join('')
+    } catch {
+      return undefined
+    }
+  }
+
   return {
     admin: getAddress('admin'),
     treasury: getAddress('treasury'),
@@ -107,6 +127,10 @@ async function decodeFactoryState(scVal: unknown): Promise<FactoryState> {
     metadataFee: getI128('metadata_fee').toString(),
     tokenCount: getU32('token_count'),
     paused: getBool('paused'),
+    // Defaults to false for factories deployed before schema v3 added the field,
+    // matching the on-chain default (whitelist enforcement off).
+    whitelistEnabled: map.get('whitelist_enabled') ? getBool('whitelist_enabled') : false,
+    tokenWasmHash: getBytesHex('token_wasm_hash'),
   }
 }
 
@@ -161,6 +185,7 @@ export function useFactoryState(): UseFactoryStateResult {
 
   // Initial fetch on mount
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetchState transitions to loading synchronously; a mount fetch is exactly what this effect is for. See #1002 follow-up
     fetchState(false)
   }, [fetchState])
 

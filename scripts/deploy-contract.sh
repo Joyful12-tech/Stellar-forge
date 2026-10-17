@@ -3,15 +3,17 @@ set -euo pipefail
 
 # ─── Usage ───────────────────────────────────────────────────────────────────
 usage() {
-  echo "Usage: $0 --network <testnet|mainnet> --admin <address> --treasury <address> [--source <secret-key>]"
+  echo "Usage: $0 --network <testnet|mainnet> --admin <address> --treasury <address> --fee-token <address> --token-wasm-hash <hash> --source <secret-key>"
   echo ""
-  echo "  --network    Target network: testnet or mainnet (required)"
-  echo "  --admin      Admin address for the contract (required)"
-  echo "  --treasury   Treasury address for fee collection (required)"
-  echo "  --source     Stellar secret key or account alias (required)"
+  echo "  --network     Target network: testnet or mainnet (required)"
+  echo "  --admin       Admin address for the contract (required)"
+  echo "  --treasury    Treasury address for fee collection (required)"
+  echo "  --fee-token       SEP-41 token address used for fee payments (required)"
+  echo "  --token-wasm-hash Wasm hash the factory deploys for each new token (required)"
+  echo "  --source          Stellar secret key or account alias (required)"
   echo ""
   echo "Example:"
-  echo "  $0 --network testnet --admin GABC... --treasury GXYZ... --source SXXX..."
+  echo "  $0 --network testnet --admin GABC... --treasury GXYZ... --fee-token CFEE... --token-wasm-hash abcd... --source SXXX..."
   exit 1
 }
 
@@ -19,25 +21,31 @@ usage() {
 NETWORK=""
 ADMIN=""
 TREASURY=""
+FEE_TOKEN=""
+TOKEN_WASM_HASH=""
 SOURCE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --network)  NETWORK="$2";   shift 2 ;;
-    --admin)    ADMIN="$2";     shift 2 ;;
-    --treasury) TREASURY="$2";  shift 2 ;;
-    --source)   SOURCE="$2";    shift 2 ;;
-    -h|--help)  usage ;;
+    --network)         NETWORK="$2";         shift 2 ;;
+    --admin)           ADMIN="$2";           shift 2 ;;
+    --treasury)        TREASURY="$2";        shift 2 ;;
+    --fee-token)       FEE_TOKEN="$2";       shift 2 ;;
+    --token-wasm-hash) TOKEN_WASM_HASH="$2"; shift 2 ;;
+    --source)          SOURCE="$2";          shift 2 ;;
+    -h|--help)         usage ;;
     *) echo "Unknown argument: $1"; usage ;;
   esac
 done
 
 # ─── Validate required arguments ─────────────────────────────────────────────
 MISSING=()
-[[ -z "$NETWORK" ]]   && MISSING+=("--network")
-[[ -z "$ADMIN" ]]     && MISSING+=("--admin")
-[[ -z "$TREASURY" ]]  && MISSING+=("--treasury")
-[[ -z "$SOURCE" ]]    && MISSING+=("--source")
+[[ -z "$NETWORK" ]]         && MISSING+=("--network")
+[[ -z "$ADMIN" ]]           && MISSING+=("--admin")
+[[ -z "$TREASURY" ]]        && MISSING+=("--treasury")
+[[ -z "$FEE_TOKEN" ]]       && MISSING+=("--fee-token")
+[[ -z "$TOKEN_WASM_HASH" ]] && MISSING+=("--token-wasm-hash")
+[[ -z "$SOURCE" ]]          && MISSING+=("--source")
 
 if [[ ${#MISSING[@]} -gt 0 ]]; then
   echo "Error: Missing required arguments: ${MISSING[*]}"
@@ -64,7 +72,9 @@ done
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 CONTRACT_DIR="$REPO_ROOT/contracts/token-factory"
-WASM_DIR="$REPO_ROOT/target/wasm32-unknown-unknown/release"
+# The cargo workspace root is `contracts/`, so build output lands in
+# `contracts/target`, not the repo-root `target`.
+WASM_DIR="$REPO_ROOT/contracts/target/wasm32v1-none/release"
 WASM_FILE="$WASM_DIR/token_factory.wasm"
 OPTIMIZED_WASM="$WASM_DIR/token_factory.optimized.wasm"
 FRONTEND_ENV="$REPO_ROOT/frontend/.env"
@@ -76,19 +86,33 @@ METADATA_FEE=30000000
 # ─── Step 1: Build ───────────────────────────────────────────────────────────
 echo ""
 echo "▶ Building contract WASM..."
-(cd "$CONTRACT_DIR" && cargo build --target wasm32-unknown-unknown --release)
+# soroban-sdk 27 rejects wasm32-unknown-unknown on Rust 1.82+; wasm32v1-none is
+# the target the contract is built and shipped from everywhere else.
+(cd "$CONTRACT_DIR" && cargo build --target wasm32v1-none --release)
 
 echo "▶ Optimizing WASM with wasm-opt..."
 wasm-opt -Oz "$WASM_FILE" -o "$OPTIMIZED_WASM"
 echo "  Optimized: $OPTIMIZED_WASM"
 
-# ─── Step 2: Deploy ──────────────────────────────────────────────────────────
+# ─── Step 2+3: Deploy and initialize atomically ──────────────────────────────
+# `initialize` runs as the contract's `__constructor`, so `stellar contract
+# deploy` invokes it as part of the same deploy transaction (Soroban's
+# deploy_v2 host function). There is no separate `invoke` call and therefore
+# no window between deployment and initialization for an attacker to race
+# with their own admin/treasury — see docs/mainnet-deployment-checklist.md.
 echo ""
-echo "▶ Deploying contract to $NETWORK..."
+echo "▶ Deploying and initializing contract on $NETWORK (atomic)..."
 CONTRACT_ID=$(stellar contract deploy \
   --wasm "$OPTIMIZED_WASM" \
   --source "$SOURCE" \
-  --network "$NETWORK" 2>&1)
+  --network "$NETWORK" \
+  -- \
+  --admin "$ADMIN" \
+  --treasury "$TREASURY" \
+  --fee_token "$FEE_TOKEN" \
+  --token_wasm_hash "$TOKEN_WASM_HASH" \
+  --base_fee "$BASE_FEE" \
+  --metadata_fee "$METADATA_FEE" 2>&1)
 
 # Validate the contract ID looks like a Stellar contract address
 if [[ ! "$CONTRACT_ID" =~ ^C[A-Z0-9]{55}$ ]]; then
@@ -99,23 +123,27 @@ fi
 
 echo "  Contract ID: $CONTRACT_ID"
 
-# ─── Step 3: Initialize ──────────────────────────────────────────────────────
+# ─── Step 4: Verify admin before publishing the address anywhere ────────────
 echo ""
-echo "▶ Initializing contract..."
-stellar contract invoke \
+echo "▶ Verifying on-chain admin matches --admin..."
+STATE_JSON=$(stellar contract invoke \
   --id "$CONTRACT_ID" \
   --source "$SOURCE" \
   --network "$NETWORK" \
   -- \
-  initialize \
-  --admin "$ADMIN" \
-  --treasury "$TREASURY" \
-  --base_fee "$BASE_FEE" \
-  --metadata_fee "$METADATA_FEE"
+  get_state 2>&1)
 
-echo "  Contract initialized."
+ONCHAIN_ADMIN=$(echo "$STATE_JSON" | grep -o '"admin":"[^"]*"' | cut -d'"' -f4)
 
-# ─── Step 4: Save to .env ────────────────────────────────────────────────────
+if [[ "$ONCHAIN_ADMIN" != "$ADMIN" ]]; then
+  echo "Error: on-chain admin ($ONCHAIN_ADMIN) does not match expected admin ($ADMIN)."
+  echo "  Do NOT publish this contract ID anywhere. Investigate before proceeding."
+  exit 1
+fi
+
+echo "  Verified: on-chain admin matches $ADMIN."
+
+# ─── Step 5: Save to .env ────────────────────────────────────────────────────
 echo ""
 echo "▶ Saving contract ID to $FRONTEND_ENV..."
 

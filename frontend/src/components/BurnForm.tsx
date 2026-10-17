@@ -1,23 +1,29 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react'
+import React, { useState, useCallback } from 'react'
 import { useForm } from 'react-hook-form'
 import { Input, Button, ConfirmModal, InsufficientBalanceWarning, Select } from './UI'
 import { useDebounce } from '../hooks/useDebounce'
 import { useTokenBalance } from '../hooks/useTokenBalance'
-import { useTransaction } from '../hooks/useTransaction'
+import { useTransaction, isTransactionInFlight } from '../hooks/useTransaction'
 import { useWalletContext } from '../context/WalletContext'
 import { useTos } from '../context/TosContext'
 import { useStellarContext } from '../context/StellarContext'
 import { useToast } from '../context/ToastContext'
-import { useNetwork } from '../context/NetworkContext'
 import { useNetworkGuard } from '../hooks/useNetworkGuard'
+import { NetworkGuardAlert } from './NetworkGuardAlert'
 import { useBalanceCheck } from '../hooks/useBalanceCheck'
 import { useTokenDashboard } from '../hooks/useTokenDashboard'
 import { isValidContractAddress } from '../utils/validation'
-import { stellarExplorerUrl } from '../utils/formatting'
+import {
+  MANUAL_TOKEN_VALUE,
+  initialTokenSelection,
+  tokenLabel,
+  tokenSelectOptions,
+} from '../utils/tokenSelect'
+import { useMountedRef } from '../hooks/useMountedRef'
+import { TxSuccessNotice } from './TxSuccessNotice'
 
 const ESTIMATED_FEE_DISPLAY = '0.01 XLM'
 const ESTIMATED_FEE_XLM = 0.01
-const MANUAL_VALUE = '__manual__'
 
 interface BurnFormData {
   tokenSelect: string
@@ -36,23 +42,16 @@ export const BurnForm: React.FC<BurnFormProps> = ({
 }) => {
   const { stellarService } = useStellarContext()
   const { wallet } = useWalletContext()
-  const { network } = useNetwork()
   const { addToast } = useToast()
   const { requireTos } = useTos()
-  const { blocked: networkBlocked, reason: networkReason } = useNetworkGuard()
+  const networkGuard = useNetworkGuard()
+  const networkBlocked = networkGuard.blocked
   const { hasSufficientBalance, shortfall, isTestnet } = useBalanceCheck(ESTIMATED_FEE_XLM)
   const { rows: myTokens } = useTokenDashboard()
-  const mountedRef = useRef(true)
+  const mountedRef = useMountedRef()
 
   const [pending, setPending] = useState(false)
   const [txHash, setTxHash] = useState<string | null>(null)
-
-  useEffect(() => {
-    mountedRef.current = true
-    return () => {
-      mountedRef.current = false
-    }
-  }, [])
 
   const {
     register,
@@ -62,17 +61,18 @@ export const BurnForm: React.FC<BurnFormProps> = ({
     formState: { errors },
   } = useForm<BurnFormData>({
     defaultValues: {
-      tokenSelect: initialAddress || (myTokens.length > 0 ? myTokens[0]!.address : MANUAL_VALUE),
+      tokenSelect: initialTokenSelection(initialAddress, myTokens),
       tokenManual: initialAddress,
       amount: '',
     },
   })
 
+  // eslint-disable-next-line react-hooks/incompatible-library -- react-hook-form's watch() is intentionally non-memoizable; the React Compiler skips this component rather than miscompiling it. See #1002 follow-up
   const tokenSelect = watch('tokenSelect')
   const tokenManual = watch('tokenManual')
   const amount = watch('amount')
 
-  const resolvedTokenAddress = tokenSelect === MANUAL_VALUE ? tokenManual : tokenSelect
+  const resolvedTokenAddress = tokenSelect === MANUAL_TOKEN_VALUE ? tokenManual : tokenSelect
   const selectedToken = myTokens.find((t) => t.address === tokenSelect)
 
   const debouncedAddress = useDebounce(resolvedTokenAddress, 300)
@@ -101,11 +101,7 @@ export const BurnForm: React.FC<BurnFormProps> = ({
   )
 
   const { execute: executeBurn, status: txStatus } = useTransaction(burnBuilder)
-  const isSubmitting =
-    txStatus === 'simulating' ||
-    txStatus === 'signing' ||
-    txStatus === 'submitting' ||
-    txStatus === 'polling'
+  const isSubmitting = isTransactionInFlight(txStatus)
 
   const onValid = () => {
     if (!wallet.isConnected) {
@@ -132,11 +128,6 @@ export const BurnForm: React.FC<BurnFormProps> = ({
     }
   }
 
-  const tokenOptions = [
-    ...myTokens.map((t) => ({ value: t.address, label: `${t.name} (${t.symbol})` })),
-    { value: MANUAL_VALUE, label: 'Manual input…' },
-  ]
-
   return (
     <>
       <form onSubmit={handleSubmit(onValid)} className="space-y-4" noValidate>
@@ -152,11 +143,7 @@ export const BurnForm: React.FC<BurnFormProps> = ({
         {/* Token selector */}
         <Select
           label="Token"
-          options={
-            tokenOptions.length > 1
-              ? tokenOptions
-              : [{ value: MANUAL_VALUE, label: 'Manual input…' }]
-          }
+          options={tokenSelectOptions(myTokens)}
           error={errors.tokenSelect?.message}
           required
           disabled={!!initialAddress}
@@ -166,7 +153,7 @@ export const BurnForm: React.FC<BurnFormProps> = ({
         />
 
         {/* Manual token address */}
-        {tokenSelect === MANUAL_VALUE && (
+        {tokenSelect === MANUAL_TOKEN_VALUE && (
           <Input
             label="Token Address"
             placeholder="C..."
@@ -264,34 +251,14 @@ export const BurnForm: React.FC<BurnFormProps> = ({
           {isSubmitting ? 'Processing…' : '🔥 Burn Tokens'}
         </Button>
 
-        {networkBlocked && networkReason && (
-          <p className="text-sm text-red-600 dark:text-red-400" role="alert">
-            {networkReason}
-          </p>
-        )}
+        <NetworkGuardAlert guard={networkGuard} />
 
         {!hasSufficientBalance && (
           <InsufficientBalanceWarning shortfall={shortfall} isTestnet={isTestnet} />
         )}
       </form>
 
-      {/* Success feedback */}
-      {txHash && (
-        <div
-          role="status"
-          className="mt-4 p-3 rounded-lg bg-green-50 dark:bg-green-900/30 border border-green-200 dark:border-green-700 text-sm text-green-800 dark:text-green-300 flex flex-col gap-1"
-        >
-          <span className="font-medium">✓ Tokens burned successfully</span>
-          <a
-            href={stellarExplorerUrl('tx', txHash, network)}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="underline text-green-700 dark:text-green-400 text-xs"
-          >
-            View on Stellar Explorer →
-          </a>
-        </div>
-      )}
+      <TxSuccessNotice txHash={txHash} message="Tokens burned successfully" />
 
       <ConfirmModal
         isOpen={pending}
@@ -300,9 +267,7 @@ export const BurnForm: React.FC<BurnFormProps> = ({
         details={[
           {
             label: 'Token',
-            value: selectedToken
-              ? `${selectedToken.name} (${selectedToken.symbol})`
-              : resolvedTokenAddress,
+            value: selectedToken ? tokenLabel(selectedToken) : resolvedTokenAddress,
           },
           { label: 'Amount to Burn', value: amount },
           { label: 'Your Balance', value: balance },

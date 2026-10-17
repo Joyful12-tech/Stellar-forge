@@ -10,7 +10,14 @@ struct FuzzMintTokensInput {
     base_fee: i128,
     // Simulates token_info.max_supply
     max_supply: Option<i128>,
-    // Simulates already-minted supply tracked in storage
+    // Simulates already-minted supply tracked in storage. Since issue #1006,
+    // `deploy_one` seeds this with `initial_supply` at creation time when
+    // `max_supply` is set, so nonzero starting values (including
+    // `current_supply == max_supply`, a token "fully minted" at creation)
+    // are the expected common case, not an edge case. See corpus seeds
+    // `initial_supply_equals_cap_any_mint_fails`,
+    // `initial_supply_near_cap_exact_remainder_succeeds`, and
+    // `initial_supply_near_cap_one_over_fails`.
     current_supply: i128,
 }
 

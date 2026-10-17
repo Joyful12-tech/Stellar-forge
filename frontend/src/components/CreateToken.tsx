@@ -4,13 +4,13 @@ import { useToast } from '../context/ToastContext'
 import { useStellarContext } from '../context/StellarContext'
 import { useWalletContext } from '../context/WalletContext'
 import { useFactoryState } from '../hooks/useFactoryState'
-import { useTransaction } from '../hooks/useTransaction'
+import { useTransaction, isTransactionInFlight } from '../hooks/useTransaction'
 import { TokenForm } from './TokenForm'
 import { ShareButton } from './ShareButton'
 import { CopyButton } from './CopyButton'
-import { STELLAR_CONFIG } from '../config/stellar'
 import ErrorBoundary from './ErrorBoundary'
 import { logger } from '../utils/logger'
+import { TransactionSubmissionError } from '../services/transactionSubmission'
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -60,6 +60,7 @@ export const CreateToken: React.FC<CreateTokenProps> = ({ onSuccess }) => {
     symbol: string
     decimals: number
     initialSupply: string
+    maxSupply?: string
   } | null>(null)
 
   const txBuilder = useCallback(
@@ -69,9 +70,9 @@ export const CreateToken: React.FC<CreateTokenProps> = ({ onSuccess }) => {
         symbol: paramsRef.current!.symbol,
         decimals: paramsRef.current!.decimals,
         initialSupply: paramsRef.current!.initialSupply,
+        maxSupply: paramsRef.current!.maxSupply,
         salt:
           Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15),
-        tokenWasmHash: STELLAR_CONFIG.tokenWasmHash || '',
         feePayment: factoryState?.baseFee ?? '100000',
       }),
     [stellarService, factoryState?.baseFee],
@@ -79,14 +80,16 @@ export const CreateToken: React.FC<CreateTokenProps> = ({ onSuccess }) => {
 
   const { execute, status } = useTransaction(txBuilder)
 
-  const isSubmitting =
-    status === 'simulating' ||
-    status === 'signing' ||
-    status === 'submitting' ||
-    status === 'polling'
+  const isSubmitting = isTransactionInFlight(status)
 
   const handleTokenFormSubmit = useCallback(
-    async (params: { name: string; symbol: string; decimals: number; initialSupply: string }) => {
+    async (params: {
+      name: string
+      symbol: string
+      decimals: number
+      initialSupply: string
+      maxSupply?: string
+    }) => {
       setShowTimeoutBanner(false)
       paramsRef.current = params
 
@@ -128,6 +131,17 @@ export const CreateToken: React.FC<CreateTokenProps> = ({ onSuccess }) => {
             }),
             'warning',
           )
+        } else if (err instanceof TransactionSubmissionError && err.status === 'unconfirmed') {
+          // The envelope may still land: same uncertainty as a client-side
+          // timeout, so show the banner rather than an error the user would
+          // answer by re-signing (and possibly minting twice).
+          setShowTimeoutBanner(true)
+          addToast(err.message, 'warning')
+        } else if (err instanceof TransactionSubmissionError && err.retryRequirement) {
+          // A decoded contract rejection: the same call cannot succeed until
+          // the named condition changes, so say so rather than leaving the
+          // user to resubmit and pay the fee again.
+          addToast(`${err.message} ${err.retryRequirement}`, 'error')
         } else {
           logger.error('Deployment error:', err)
           addToast(err instanceof Error ? err.message : t('tokenForm.deployError'), 'error')

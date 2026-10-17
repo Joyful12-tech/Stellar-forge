@@ -1,52 +1,133 @@
 #![no_main]
 
+extern crate std;
+
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
+use soroban_sdk::{
+    testutils::Address as _,
+    token::{StellarAssetClient, TokenClient},
+    Address, BytesN, Env, String,
+};
+use token_factory::{Error, TokenFactory, TokenFactoryArgs, TokenFactoryClient};
 
+/// Fuzz input: the balance to seed the burner with, the amount to burn, and
+/// whether burning is enabled for the token. The full `i64` range (rather
+/// than `i128`) keeps generated inputs dense around realistic magnitudes
+/// while still covering zero/negative amounts and large balances.
 #[derive(Arbitrary, Debug, Clone)]
 struct FuzzBurnInput {
-    initial_balance: i128,
-    burn_amount_offset: i128,
-    burn_iterations: u8,
+    initial_balance: i64,
+    burn_amount: i64,
+    burn_enabled: bool,
 }
 
+fn dummy_hash(env: &Env) -> BytesN<32> {
+    BytesN::from_array(env, &[0u8; 32])
+}
+
+// This target drives the *real* `TokenFactory::burn` entrypoint (via the
+// generated `TokenFactoryClient`) against a live `soroban_sdk::testutils`
+// `Env`, rather than reimplementing burn's arithmetic inline. The only
+// bypass is token *registration*: no real token WASM is available to install
+// at a `token_wasm_hash` in a native test/fuzz environment (see the note on
+// `mod bench` in `src/lib.rs`), so — exactly like the crate's own
+// `seed_token` helper in `src/test.rs` — a real Stellar Asset Contract
+// stands in for the deployed token, and `TokenFactory::fuzz_seed_token`
+// (a `#[cfg(feature = "testutils")]`-only, non-`#[contractimpl]` associated
+// function) records it in factory storage the same way `create_token` would
+// have. Everything downstream of that — the `burn` call itself, its
+// `TokenNotFound`/`Unauthorized`/`InvalidBurnAmount`/
+// `BurnAmountExceedsBalance` gates, its reentrancy lock, and its actual
+// cross-contract `token::burn` invocation — runs as real contract code.
 fuzz_target!(|input: FuzzBurnInput| {
-    // Test arithmetic operations used in burn logic
-    let initial_balance = input.initial_balance.saturating_abs().min(i128::MAX / 2);
-    let burn_amount = input.burn_amount_offset.saturating_abs().min(initial_balance);
-    
-    // Simulate burn arithmetic
-    if burn_amount > 0 && burn_amount <= initial_balance {
-        let remaining = initial_balance.saturating_sub(burn_amount);
-        assert_eq!(remaining, initial_balance - burn_amount);
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let burner = Address::generate(&env);
+    let fee_token = env.register_stellar_asset_contract_v2(admin.clone()).address();
+
+    let factory_id = env.register(
+        TokenFactory,
+        TokenFactoryArgs::__constructor(&admin, &treasury, &fee_token, &dummy_hash(&env), &1_000, &500),
+    );
+    let client = TokenFactoryClient::new(&env, &factory_id);
+
+    let token_addr = env
+        .register_stellar_asset_contract_v2(creator.clone())
+        .address();
+    env.as_contract(&factory_id, || {
+        TokenFactory::fuzz_seed_token(
+            &env,
+            &token_addr,
+            &creator,
+            String::from_str(&env, "FuzzToken"),
+            String::from_str(&env, "FUZ"),
+            7,
+            input.burn_enabled,
+            None,
+        );
+    });
+
+    let initial_balance = (input.initial_balance as i128).saturating_abs();
+    if initial_balance > 0 {
+        StellarAssetClient::new(&env, &token_addr).mint(&burner, &initial_balance);
     }
-    
-    // Test multiple burns in sequence
-    let mut balance = initial_balance;
-    let iterations = input.burn_iterations.min(50) as usize;
-    
-    for _ in 0..iterations {
-        if balance > 0 {
-            let amount = balance / 2; // Burn half, avoiding division by zero
-            balance = balance.saturating_sub(amount);
-            // Balance should never go negative
-            assert!(balance >= 0);
+
+    let burn_amount = input.burn_amount as i128;
+    let balance_before = TokenClient::new(&env, &token_addr).balance(&burner);
+
+    let result = client.try_burn(&token_addr, &burner, &burn_amount);
+
+    match result {
+        Ok(Err(conv)) => panic!("unexpected XDR conversion error from burn: {conv:?}"),
+        Ok(Ok(())) => {
+            assert!(
+                input.burn_enabled,
+                "burn succeeded while burn_enabled=false"
+            );
+            assert!(
+                burn_amount > 0,
+                "burn succeeded with non-positive amount {burn_amount}"
+            );
+            assert!(
+                burn_amount <= balance_before,
+                "burn succeeded burning {burn_amount} against balance {balance_before}"
+            );
+            let balance_after = TokenClient::new(&env, &token_addr).balance(&burner);
+            assert_eq!(
+                balance_after,
+                balance_before - burn_amount,
+                "balance did not decrease by exactly the burned amount \
+                 (before={balance_before}, amount={burn_amount}, after={balance_after})"
+            );
+        }
+        Err(Ok(Error::InvalidBurnAmount)) => {
+            assert!(
+                burn_amount <= 0,
+                "InvalidBurnAmount returned for a positive amount {burn_amount}"
+            );
+        }
+        Err(Ok(Error::BurnAmountExceedsBalance)) => {
+            assert!(
+                burn_amount > balance_before,
+                "BurnAmountExceedsBalance returned within balance \
+                 ({burn_amount} <= {balance_before})"
+            );
+        }
+        Err(Ok(Error::Unauthorized)) => {
+            assert!(
+                !input.burn_enabled,
+                "Unauthorized returned while burn_enabled=true"
+            );
+        }
+        Err(Ok(other)) => panic!("unexpected contract error from burn: {other:?}"),
+        Err(Err(_)) => {
+            // Host-level invoke error (e.g. resource exhaustion on a very
+            // large seeded balance) — not a contract-logic bug to assert on.
         }
     }
-    
-    // Test boundary condition: burning entire balance
-    if initial_balance > 0 {
-        let remaining_after_full_burn = initial_balance.saturating_sub(initial_balance);
-        assert_eq!(remaining_after_full_burn, 0);
-    }
-    
-    // Test invalid burn scenarios
-    let invalid_negative_burn = (-100i128).saturating_abs(); // Make positive
-    assert!(invalid_negative_burn >= 0);
-    
-    // Test burn with overflow protection
-    let max_burn = i128::MAX;
-    let safe_operation = max_burn.saturating_mul(2);
-    assert!(safe_operation >= 0 || safe_operation == i128::MIN); // Saturated
 });
-

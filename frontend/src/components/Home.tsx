@@ -4,7 +4,6 @@ import { useToast } from '../context/ToastContext'
 import { useStellarContext } from '../context/StellarContext'
 import { useWalletContext } from '../context/WalletContext'
 import { TokenForm } from './TokenForm'
-import { STELLAR_CONFIG } from '../config/stellar'
 
 export const Home: React.FC = () => {
   const { t } = useTranslation()
@@ -17,11 +16,11 @@ export const Home: React.FC = () => {
     symbol: string
     decimals: number
     initialSupply: string
+    maxSupply?: string
   }) => {
     const result = await stellarService.deployToken({
       ...params,
       salt: Math.random().toString(36).slice(2, 15),
-      tokenWasmHash: STELLAR_CONFIG.tokenWasmHash || '',
       feePayment: '100000',
     })
 

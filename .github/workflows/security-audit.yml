@@ -10,9 +10,27 @@ on:
     - cron: '0 8 * * 1'
 
 jobs:
+  waiver-lint:
+    name: waiver lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '20'
+
+      # Every waived advisory must carry a justification, a tracking link and a
+      # review-by date. Fails on a malformed or undocumented waiver; expired
+      # waivers are reported as warnings here and enforced by waiver-review.
+      - name: Validate audit waivers
+        run: node scripts/check-audit-waivers.mjs
+
   npm-audit:
     name: npm audit
     runs-on: ubuntu-latest
+    needs: waiver-lint
     defaults:
       run:
         working-directory: frontend
@@ -20,7 +38,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: '20'
           cache: npm
@@ -29,12 +47,15 @@ jobs:
       - name: Install dependencies
         run: npm ci --legacy-peer-deps
 
+      # audit-ci wraps `npm audit` and honours the allowlist in
+      # frontend/audit-ci.jsonc. Untriaged high/critical advisories still fail.
       - name: Run npm audit
-        run: npm audit --audit-level=high
+        run: npx --yes audit-ci@^7 --config audit-ci.jsonc
 
   cargo-audit:
     name: cargo audit
     runs-on: ubuntu-latest
+    needs: waiver-lint
 
     steps:
       - uses: actions/checkout@v7
@@ -50,6 +71,61 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
 
-      - name: Run cargo audit
+      # cargo-audit reads contracts/.cargo/audit.toml automatically, which
+      # holds the `[advisories] ignore` waiver list.
+      - name: Run cargo audit (main contracts workspace)
         working-directory: contracts
         run: cargo audit
+
+  cargo-audit-fuzz:
+    name: cargo audit (fuzz workspace)
+    runs-on: ubuntu-latest
+    needs: waiver-lint
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies (fuzz)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: contracts/token-factory/fuzz
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      # The fuzz directory is its own Cargo workspace with a separate
+      # Cargo.lock, so it must be audited independently. Its transitive
+      # dependencies (libfuzzer-sys, arbitrary, …) are not covered by the
+      # main workspace audit above.
+      #
+      # If a fuzz-only advisory needs to be waived, add it to
+      # contracts/token-factory/fuzz/.cargo/audit.toml with the standard
+      # justification / review-by fields (see docs/security-triage.md).
+      - name: Generate Cargo.lock for fuzz workspace
+        working-directory: contracts/token-factory/fuzz
+        run: cargo generate-lockfile
+
+      - name: Run cargo audit (fuzz workspace)
+        working-directory: contracts/token-factory/fuzz
+        run: cargo audit
+
+  waiver-review:
+    name: waiver review
+    runs-on: ubuntu-latest
+    # Waivers are time-boxed, not permanent. On the weekly cron this job fails
+    # once any Review-by date has passed, forcing re-triage instead of letting
+    # the waiver silently persist forever.
+    if: github.event_name == 'schedule'
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '20'
+
+      - name: Flag waivers past their review-by date
+        run: node scripts/check-audit-waivers.mjs --fail-on-expired

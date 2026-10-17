@@ -6,15 +6,86 @@ import type { TokenInfo } from '../types'
 // ── Module-level cache keyed by creator address ('' = all tokens) ─────────────
 // Shared across all hook instances — any component mounting within the TTL
 // window reuses the same result without an extra network round-trip.
+//
+// LRU eviction: JavaScript's Map preserves insertion order, so we implement
+// LRU by deleting and re-inserting a key on every read or write (moving it
+// to the "most-recently-used" tail). When the map exceeds CACHE_MAX_SIZE the
+// first (oldest / least-recently-used) entry is evicted. This caps memory
+// use regardless of how many distinct creator addresses are queried in a
+// long-lived session (e.g. the Token Explorer browsing hundreds of creators).
 
 const CACHE_TTL_MS = 30_000
+/** Maximum number of creator-keyed entries kept in memory at one time. */
+export const CACHE_MAX_SIZE = 50
 
 interface CacheEntry {
   tokens: TokenInfo[]
   fetchedAt: number
+  /**
+   * Server-reported total for global (all-tokens) pages. Undefined for
+   * creator-keyed entries, whose total is simply `tokens.length`.
+   */
+  total?: number
 }
 
 const cache = new Map<string, CacheEntry>()
+
+// ── Global "all tokens" page cache ──────────────────────────────────────────
+//
+// Global pages are server-paginated via `getAllTokens(offset, limit)` and
+// cached per (network, contractId, pageSize, page) so navigating back and
+// forth between pages does not re-hit the RPC within the TTL window. Keeping
+// the key network/contract-scoped means switching network or factory never
+// serves a stale page from a different chain.
+
+const GLOBAL_KEY_PREFIX = 'all'
+
+function globalPageKey(page: number, pageSize: number): string {
+  return `${GLOBAL_KEY_PREFIX}:${STELLAR_CONFIG.network}:${STELLAR_CONFIG.factoryContractId}:${pageSize}:${page}`
+}
+
+/**
+ * Drop every cached global page for the current (network, contractId). Called
+ * on `refresh()` in global mode — e.g. after a confirmed `created` event
+ * invalidates the list (see App's CreateTokenWrapper) — so a new token shows
+ * up without waiting for the TTL to lapse.
+ */
+function invalidateGlobalPages(): void {
+  const prefix = `${GLOBAL_KEY_PREFIX}:${STELLAR_CONFIG.network}:${STELLAR_CONFIG.factoryContractId}:`
+  for (const key of [...cache.keys()]) {
+    if (key.startsWith(prefix)) cache.delete(key)
+  }
+}
+
+/**
+ * Read an entry and promote it to most-recently-used.
+ * Returns undefined on a cache miss.
+ */
+function cacheGet(key: string): CacheEntry | undefined {
+  const entry = cache.get(key)
+  if (entry === undefined) return undefined
+  // Re-insert to move to tail (most-recently-used position).
+  cache.delete(key)
+  cache.set(key, entry)
+  return entry
+}
+
+/**
+ * Write an entry, promote it to MRU, and evict the LRU entry when the cap
+ * is exceeded.
+ */
+function cacheSet(key: string, entry: CacheEntry): void {
+  // Delete first so a re-write moves the key to the tail.
+  cache.delete(key)
+  cache.set(key, entry)
+  if (cache.size > CACHE_MAX_SIZE) {
+    // The first key in iteration order is the least-recently-used one.
+    const lruKey = cache.keys().next().value
+    if (lruKey !== undefined) {
+      cache.delete(lruKey)
+    }
+  }
+}
 
 /** Exposed for testing only */
 export function _clearCache() {
@@ -24,10 +95,40 @@ export function _clearCache() {
 // ── Paginated token fetcher ────────────────────────────────────────────────────
 //
 // The contract's `get_tokens_by_creator(env, creator, offset, limit)` view
-// function caps responses at MAX_TOKENS_BY_CREATOR_PAGE per call to avoid
-// exceeding Stellar ledger entry size limits on mainnet. This helper
-// iterates the contract page-by-page until the returned slice is shorter
-// than the requested page size (which signals end-of-data).
+// function caps responses at MAX_TOKENS_BY_CREATOR_PAGE (50) per call to
+// avoid exceeding Stellar ledger entry size limits on mainnet.
+//
+// Performance rationale
+// ─────────────────────
+// BEFORE (sequential): each page was awaited individually, so a creator with
+//   N pages incurred N × RPC-latency wall-clock time (e.g. 10 pages × ~400 ms
+//   = ~4 s before the UI could render anything).
+//
+// AFTER (concurrent): page 0 is still fetched first to establish (a) that
+//   there is more data and (b) the page size in use.  Once we know how many
+//   additional pages exist we issue them all at once — capped at
+//   CONCURRENT_PAGE_LIMIT simultaneous in-flight requests to avoid
+//   overwhelming the RPC endpoint or tripping rate limits.  For the same
+//   10-page example the total wait drops to roughly 1 × RPC-latency for the
+//   probe page + 1 × RPC-latency for the concurrent batch ≈ ~800 ms — an
+//   ~80 % wall-clock reduction on a latency-bound path.
+//
+// Concurrency cap
+// ───────────────
+// CONCURRENT_PAGE_LIMIT = 5 was chosen to stay comfortably below typical
+// Soroban RPC per-IP rate limits while still saturating a reasonable number
+// of parallel connections.  For reference, issue #16 flags concern about
+// total RPC load; 5 concurrent views per hook call is a reasonable balance.
+
+/** Maximum simultaneous in-flight getTokensByCreator requests for pages ≥ 1 */
+const CONCURRENT_PAGE_LIMIT = 5
+
+/**
+ * Hard upper bound on pages fetched for one creator, to prevent runaway
+ * requests if the contract ever returned a full page at the very end
+ * (defensive; the contract guarantees a short page at end-of-data).
+ */
+const MAX_CREATOR_PAGES = 10_000
 
 async function fetchAllTokensByCreator(creator: string): Promise<TokenInfo[]> {
   if (!STELLAR_CONFIG.factoryContractId) {
@@ -36,18 +137,36 @@ async function fetchAllTokensByCreator(creator: string): Promise<TokenInfo[]> {
 
   // Mirror the contract's per-page cap so successive calls advance correctly.
   const pageSize = 50
-  const collected: TokenInfo[] = []
-  let offset = 0
-  // Hard upper bound to prevent infinite loops if the contract ever returns
-  // a "full" page beyond the actual total (defensive only — contract
-  // guarantees it returns < limit when the offset reaches the end).
-  const maxPages = 10_000
 
-  for (let page = 0; page < maxPages; page++) {
-    const slice = await stellarService.getTokensByCreator(creator, offset, pageSize)
-    collected.push(...slice)
-    if (slice.length < pageSize) break
-    offset += slice.length
+  // ── Phase 1: probe page 0 ─────────────────────────────────────────────────
+  // Fetching page 0 first tells us whether there is more data (returned a full
+  // page) without needing a separate get_state() call, keeping the happy-path
+  // cost at a single extra round-trip only when multiple pages exist.
+  const firstPage = await stellarService.getTokensByCreator(creator, 0, pageSize)
+
+  if (firstPage.length < pageSize) {
+    // All tokens fit in one page — no concurrent work needed.
+    return firstPage
+  }
+
+  // ── Phase 2: fetch the remaining pages concurrently, in batches ───────────
+  // We do NOT know the exact total upfront (get_state().token_count is a
+  // global count, not per-creator), so we request CONCURRENT_PAGE_LIMIT pages
+  // at a time and stop at the first short (or empty) page — pages past the
+  // end simply come back empty.
+  const collected: TokenInfo[] = [...firstPage]
+
+  for (let batchStart = 1; batchStart < MAX_CREATOR_PAGES; batchStart += CONCURRENT_PAGE_LIMIT) {
+    const batchEnd = Math.min(batchStart + CONCURRENT_PAGE_LIMIT, MAX_CREATOR_PAGES)
+    const pageNumbers = Array.from({ length: batchEnd - batchStart }, (_, i) => batchStart + i)
+    const pages = await Promise.all(
+      pageNumbers.map((p) => stellarService.getTokensByCreator(creator, p * pageSize, pageSize)),
+    )
+
+    for (const page of pages) {
+      collected.push(...page)
+      if (page.length < pageSize) return collected
+    }
   }
 
   return collected
@@ -59,10 +178,10 @@ export interface UseTokensResult {
   /** Tokens for the current page (1-based) */
   tokens: TokenInfo[]
   /**
-   * Accumulated tokens across all fetched pages. Kept on the result shape
-   * for backward-compatibility with code that consumed the previous client-
-   * side pagination API; in the new server-paginated implementation this is
-   * the same value backing `tokens`.
+   * The full working set backing `tokens`. In creator mode this is every
+   * token for that creator (sliced client-side into `tokens`); in global mode
+   * the server already returns one page at a time, so this equals `tokens`.
+   * Kept for backward-compatibility with earlier consumers.
    */
   allTokens: TokenInfo[]
   isLoading: boolean
@@ -81,21 +200,39 @@ export interface UseTokensResult {
 // ── Hook ──────────────────────────────────────────────────────────────────────
 
 export function useTokens(creator?: string): UseTokensResult {
-  const cacheKey = creator ?? ''
+  // Two data paths share this hook:
+  //   • Creator mode (`creator` given): the contract's paginated
+  //     `get_tokens_by_creator` view is walked to completion once, cached by
+  //     creator address, and sliced client-side for page navigation.
+  //   • Global mode (no `creator`): the "all tokens" list is server-paginated
+  //     via `getAllTokens(offset, limit)` — one page per fetch, newest-first,
+  //     cached per (network, contractId, pageSize, page).
+  const isGlobal = !creator
+  const creatorKey = creator ?? ''
 
-  const [tokens, setTokens] = useState<TokenInfo[]>(() => cache.get(cacheKey)?.tokens ?? [])
+  const [tokens, setTokens] = useState<TokenInfo[]>(() =>
+    isGlobal ? [] : (cacheGet(creatorKey)?.tokens ?? []),
+  )
+  // Server-reported total, used only in global mode (creator mode derives its
+  // total from the accumulated list length).
+  const [serverTotal, setServerTotal] = useState(0)
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState<Error | null>(null)
   const [page, setPageRaw] = useState(1)
   const [pageSize, setPageSizeRaw] = useState(10)
 
-  // Prevent duplicate in-flight requests when multiple components mount at once
+  // Creator mode: prevent duplicate in-flight requests when multiple
+  // components mount at once.
   const fetchingRef = useRef(false)
+  // Global mode: "latest request wins". Page navigation can supersede an
+  // in-flight fetch, so responses tagged with a stale id are discarded rather
+  // than clobbering the page the user actually navigated to.
+  const requestIdRef = useRef(0)
 
-  const load = useCallback(
+  const loadCreator = useCallback(
     async (bypassCache: boolean) => {
       const now = Date.now()
-      const hit = cache.get(cacheKey)
+      const hit = cacheGet(creatorKey)
 
       if (!bypassCache && hit && now - hit.fetchedAt < CACHE_TTL_MS) {
         setTokens(hit.tokens)
@@ -109,15 +246,9 @@ export function useTokens(creator?: string): UseTokensResult {
       setError(null)
 
       try {
-        let result: TokenInfo[]
-        if (creator) {
-          result = await fetchAllTokensByCreator(creator)
-        } else {
-          result = await fetchAllTokens()
-        }
-        cache.set(cacheKey, { tokens: result, fetchedAt: Date.now() })
+        const result = await fetchAllTokensByCreator(creatorKey)
+        cacheSet(creatorKey, { tokens: result, fetchedAt: Date.now() })
         setTokens(result)
-        // Reset to first page whenever data is refreshed
         setPageRaw(1)
       } catch (err) {
         setError(err instanceof Error ? err : new Error(String(err)))
@@ -126,16 +257,57 @@ export function useTokens(creator?: string): UseTokensResult {
         fetchingRef.current = false
       }
     },
-    [cacheKey, creator],
+    [creatorKey],
+  )
+
+  const loadGlobalPage = useCallback(
+    async (targetPage: number, size: number, bypassCache: boolean) => {
+      if (bypassCache) invalidateGlobalPages()
+
+      const key = globalPageKey(targetPage, size)
+      const now = Date.now()
+      const hit = cacheGet(key)
+
+      if (!bypassCache && hit && now - hit.fetchedAt < CACHE_TTL_MS) {
+        setTokens(hit.tokens)
+        setServerTotal(hit.total ?? hit.tokens.length)
+        return
+      }
+
+      const reqId = ++requestIdRef.current
+      setIsLoading(true)
+      setError(null)
+
+      try {
+        const { tokens: pageTokens, total } = await stellarService.getAllTokens(
+          (targetPage - 1) * size,
+          size,
+        )
+        if (reqId !== requestIdRef.current) return // superseded by a newer page
+        cacheSet(key, { tokens: pageTokens, total, fetchedAt: Date.now() })
+        setTokens(pageTokens)
+        setServerTotal(total)
+      } catch (err) {
+        if (reqId !== requestIdRef.current) return
+        setError(err instanceof Error ? err : new Error(String(err)))
+      } finally {
+        if (reqId === requestIdRef.current) setIsLoading(false)
+      }
+    },
+    [],
   )
 
   useEffect(() => {
-    load(false)
-  }, [load])
+    const load = isGlobal ? () => loadGlobalPage(page, pageSize, false) : () => loadCreator(false)
+    load()
+  }, [isGlobal, page, pageSize, loadGlobalPage, loadCreator])
 
-  const refresh = useCallback(() => load(true), [load])
+  const refresh = useCallback(() => {
+    if (isGlobal) return loadGlobalPage(page, pageSize, true)
+    return loadCreator(true)
+  }, [isGlobal, page, pageSize, loadGlobalPage, loadCreator])
 
-  const totalCount = tokens.length
+  const totalCount = isGlobal ? serverTotal : tokens.length
   const totalPages = Math.max(1, Math.ceil(totalCount / pageSize))
 
   const setPage = useCallback(
@@ -148,13 +320,13 @@ export function useTokens(creator?: string): UseTokensResult {
     setPageRaw(1)
   }, [])
 
-  // Slice the accumulated list to the current page. Because the contract call
-  // is paginated server-side via offset/limit but the hook iterates fully to
-  // populate this list, page navigation stays cheap and snappy.
+  // In global mode `tokens` already holds exactly the current server page. In
+  // creator mode it holds the full accumulated list, sliced to the page here.
   const visible = useMemo(() => {
+    if (isGlobal) return tokens
     const start = (page - 1) * pageSize
     return tokens.slice(start, start + pageSize)
-  }, [tokens, page, pageSize])
+  }, [isGlobal, tokens, page, pageSize])
 
   return {
     tokens: visible,
@@ -169,29 +341,4 @@ export function useTokens(creator?: string): UseTokensResult {
     setPageSize,
     refresh,
   }
-}
-
-// ── Fallback "all tokens" fetcher (kept from the original hook) ──────────────
-
-async function fetchAllTokens(): Promise<TokenInfo[]> {
-  const contractId = STELLAR_CONFIG.factoryContractId
-  if (!contractId) throw new Error('VITE_FACTORY_CONTRACT_ID is not configured')
-
-  const { events } = await stellarService.getContractEvents(contractId, 100)
-  const addresses = [
-    ...new Set(
-      events
-        .filter((e) => e.type === 'created')
-        .map((e) => e.data.tokenAddress)
-        .filter((addr): addr is string => !!addr),
-    ),
-  ]
-
-  const results = await Promise.allSettled(
-    addresses.map((addr) => stellarService.getTokenInfoByAddress(addr)),
-  )
-
-  return results
-    .filter((r): r is PromiseFulfilledResult<TokenInfo> => r.status === 'fulfilled')
-    .map((r) => r.value)
 }

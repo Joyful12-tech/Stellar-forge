@@ -1,0 +1,35 @@
+# A thin `rlib`-only crate that compiles the token-factory contract's exact
+# source (`../src/lib.rs`) so it can be depended on as an ordinary Rust
+# library — by the fuzz targets in `../fuzz`, which cannot otherwise reach
+# this crate's public entrypoints or its `#[cfg(feature = "testutils")]`
+# seeding helper (`TokenFactory::fuzz_seed_token`).
+#
+# This exists as a *separate* crate, rather than adding "rlib" to
+# `../Cargo.toml`'s `crate-type`, because requesting an rlib output there
+# forces rustc to drop the fat-LTO build that keeps the on-chain WASM under
+# the 64 KiB size budget (`scripts/check-wasm-size.mjs`) — cdylib+rlib jumped
+# the optimized WASM from ~42 KB to ~68 KB in testing. The real contract
+# package stays `crate-type = ["cdylib"]` only; this crate is never part of
+# the `contracts` workspace (see the empty `[workspace]` below, the same
+# pattern `../fuzz/Cargo.toml` already uses) so it is invisible to
+# `cargo build --target wasm32v1-none --release`, `cargo test`, and
+# `cargo fmt` run from `contracts/`.
+[package]
+name = "token-factory-testutils-lib"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[lib]
+name = "token_factory"
+path = "../src/lib.rs"
+crate-type = ["rlib"]
+
+[dependencies]
+soroban-sdk = { version = "27.0.0", features = ["testutils"] }
+soroban-token-sdk = { version = "27.0.0" }
+
+[features]
+testutils = ["soroban-sdk/testutils"]
+bench = []

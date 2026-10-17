@@ -8,43 +8,130 @@ on:
   schedule:
     # Run daily at 2 AM UTC
     - cron: "0 2 * * *"
+  workflow_dispatch:
 
 jobs:
-  fuzz:
-    name: Fuzz Test Contract
+  # ── PR smoke fuzz (short, fast-failing) ──────────────────────────────
+  smoke:
+    name: Fuzz Smoke (PR)
     runs-on: ubuntu-latest
-    
+    if: github.event_name == 'pull_request'
+
     steps:
       - uses: actions/checkout@v7
-      
+
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-unknown-unknown
-      
+          targets: wasm32v1-none
+
       - name: Install Rust (nightly for libfuzzer)
         uses: dtolnay/rust-toolchain@nightly
-      
+
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: contracts
 
       - name: Restore fuzz corpus cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: contracts/token-factory/fuzz/corpus-cache
           key: fuzz-corpus-${{ runner.os }}-${{ github.ref_name }}
           restore-keys: |
             fuzz-corpus-${{ runner.os }}-
 
-      # Pre-populate runtime corpus dirs from committed seeds + cached corpus
       - name: Prepare fuzz corpus
         working-directory: contracts/token-factory/fuzz
         run: |
           for target in fuzz_create_token fuzz_mint_tokens fuzz_fee_arithmetic fuzz_burn fuzz_set_metadata; do
             mkdir -p "corpus-cache/$target"
-            # Start from committed seeds
+            if [ -d "corpus/$target" ]; then
+              cp -n corpus/$target/* "corpus-cache/$target/" 2>/dev/null || true
+            fi
+          done
+          echo "Corpus ready — $(find corpus-cache -type f | wc -l) seed files"
+
+      - name: Smoke create_token
+        working-directory: contracts/token-factory/fuzz
+        run: |
+          cargo +nightly run --release --bin fuzz_create_token -- \
+            -max_len=10000 -timeout=12 -max_total_time=12 \
+            corpus-cache/fuzz_create_token
+
+      - name: Smoke fee_arithmetic
+        working-directory: contracts/token-factory/fuzz
+        run: |
+          cargo +nightly run --release --bin fuzz_fee_arithmetic -- \
+            -max_len=1000 -timeout=12 -max_total_time=12 \
+            corpus-cache/fuzz_fee_arithmetic
+
+      - name: Smoke burn
+        working-directory: contracts/token-factory/fuzz
+        run: |
+          cargo +nightly run --release --bin fuzz_burn -- \
+            -max_len=1000 -timeout=12 -max_total_time=12 \
+            corpus-cache/fuzz_burn
+
+      - name: Smoke set_metadata
+        working-directory: contracts/token-factory/fuzz
+        run: |
+          cargo +nightly run --release --bin fuzz_set_metadata -- \
+            -max_len=10000 -timeout=12 -max_total_time=12 \
+            corpus-cache/fuzz_set_metadata
+
+      - name: Smoke mint_tokens
+        working-directory: contracts/token-factory/fuzz
+        run: |
+          cargo +nightly run --release --bin fuzz_mint_tokens -- \
+            -max_len=1000 -timeout=12 -max_total_time=12 \
+            corpus-cache/fuzz_mint_tokens
+
+      - name: Upload fuzz artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-smoke-artifacts
+          path: |
+            contracts/token-factory/fuzz/artifacts/
+            contracts/token-factory/fuzz/crash-*
+          retention-days: 7
+
+  # ── Scheduled full fuzz (long, thorough) ─────────────────────────────
+  fuzz:
+    name: Fuzz Test Contract (Scheduled)
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+
+      - name: Install Rust (nightly for libfuzzer)
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: contracts
+
+      - name: Restore fuzz corpus cache
+        uses: actions/cache@v6
+        with:
+          path: contracts/token-factory/fuzz/corpus-cache
+          key: fuzz-corpus-${{ runner.os }}-${{ github.ref_name }}
+          restore-keys: |
+            fuzz-corpus-${{ runner.os }}-
+
+      - name: Prepare fuzz corpus
+        working-directory: contracts/token-factory/fuzz
+        run: |
+          for target in fuzz_create_token fuzz_mint_tokens fuzz_fee_arithmetic fuzz_burn fuzz_set_metadata; do
+            mkdir -p "corpus-cache/$target"
             if [ -d "corpus/$target" ]; then
               cp -n corpus/$target/* "corpus-cache/$target/" 2>/dev/null || true
             fi
@@ -53,45 +140,38 @@ jobs:
 
       - name: Run create_token fuzz target
         working-directory: contracts/token-factory/fuzz
-        # Use the merged corpus-cache dir so the fuzzer starts from
-        # previously-discovered inputs instead of from scratch.
-        run: >
-          cargo +nightly run --release --bin fuzz_create_token --
-          -max_len=10000 -timeout=60 -max_total_time=60
-          corpus-cache/fuzz_create_token
-        continue-on-error: true
-      
+        run: |
+          cargo +nightly run --release --bin fuzz_create_token -- \
+            -max_len=10000 -timeout=60 -max_total_time=60 \
+            corpus-cache/fuzz_create_token
+
       - name: Run fee_arithmetic fuzz target
         working-directory: contracts/token-factory/fuzz
-        run: >
-          cargo +nightly run --release --bin fuzz_fee_arithmetic --
-          -max_len=1000 -timeout=60 -max_total_time=60
-          corpus-cache/fuzz_fee_arithmetic
-        continue-on-error: true
-      
+        run: |
+          cargo +nightly run --release --bin fuzz_fee_arithmetic -- \
+            -max_len=1000 -timeout=60 -max_total_time=60 \
+            corpus-cache/fuzz_fee_arithmetic
+
       - name: Run burn fuzz target
         working-directory: contracts/token-factory/fuzz
-        run: >
-          cargo +nightly run --release --bin fuzz_burn --
-          -max_len=1000 -timeout=60 -max_total_time=60
-          corpus-cache/fuzz_burn
-        continue-on-error: true
+        run: |
+          cargo +nightly run --release --bin fuzz_burn -- \
+            -max_len=1000 -timeout=60 -max_total_time=60 \
+            corpus-cache/fuzz_burn
 
       - name: Run set_metadata fuzz target
         working-directory: contracts/token-factory/fuzz
-        run: >
-          cargo +nightly run --release --bin fuzz_set_metadata --
-          -max_len=10000 -timeout=60 -max_total_time=60
-          corpus-cache/fuzz_set_metadata
-        continue-on-error: true
+        run: |
+          cargo +nightly run --release --bin fuzz_set_metadata -- \
+            -max_len=10000 -timeout=60 -max_total_time=60 \
+            corpus-cache/fuzz_set_metadata
 
       - name: Run mint_tokens fuzz target
         working-directory: contracts/token-factory/fuzz
-        run: >
-          cargo +nightly run --release --bin fuzz_mint_tokens --
-          -max_len=1000 -timeout=60 -max_total_time=60
-          corpus-cache/fuzz_mint_tokens
-        continue-on-error: true
+        run: |
+          cargo +nightly run --release --bin fuzz_mint_tokens -- \
+            -max_len=1000 -timeout=60 -max_total_time=60 \
+            corpus-cache/fuzz_mint_tokens
 
       - name: Upload fuzz artifacts on failure
         if: failure()
@@ -103,12 +183,9 @@ jobs:
             contracts/token-factory/fuzz/crash-*
           retention-days: 7
 
-      # Re-save the corpus cache so newly discovered interesting inputs
-      # accumulate across CI runs rather than being discarded.
       - name: Save fuzz corpus cache
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: contracts/token-factory/fuzz/corpus-cache
           key: fuzz-corpus-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
-

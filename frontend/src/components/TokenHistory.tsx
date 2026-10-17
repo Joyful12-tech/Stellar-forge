@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useState } from 'react'
 import { useStellarContext } from '../context/StellarContext'
 import { useNetwork } from '../context/NetworkContext'
 import { formatAddress, formatTimestamp } from '../utils/formatting'
@@ -15,49 +15,31 @@ export const TokenHistory: React.FC<TokenHistoryProps> = ({ tokenAddress }) => {
   const { network } = useNetwork()
   const [events, setEvents] = useState<ContractEvent[]>([])
   const [loading, setLoading] = useState(true)
-  const [loadingMore, setLoadingMore] = useState(false)
-  // Held in a ref (not state) so loadEvents can read the latest cursor without
-  // listing it as a dependency — the cursor isn't rendered directly.
-  const cursorRef = useRef<string | null>(null)
-  const [hasMore, setHasMore] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  // Disclosure: Soroban RPC only retains events for a bounded window, so this
+  // list is never the token's complete lifetime. See getTokenEvents.
+  const [retentionDays, setRetentionDays] = useState<number | null>(null)
 
-  const loadEvents = useCallback(
-    async (isLoadMore = false) => {
-      try {
-        if (isLoadMore) {
-          setLoadingMore(true)
-        } else {
-          setLoading(true)
-        }
-        setError(null)
+  const loadEvents = useCallback(async () => {
+    try {
+      setLoading(true)
+      setError(null)
 
-        const result = await stellarService.getTokenEvents(
-          tokenAddress,
-          20,
-          isLoadMore ? (cursorRef.current ?? undefined) : undefined,
-        )
+      // getTokenEvents paginates exhaustively through the RPC's retained event
+      // history, so a single call returns everything available for this token.
+      const result = await stellarService.getTokenEvents(tokenAddress)
 
-        if (isLoadMore) {
-          setEvents((prev) => [...prev, ...result.events])
-        } else {
-          setEvents(result.events)
-        }
-
-        cursorRef.current = result.cursor
-        setHasMore(result.cursor !== null && result.events.length > 0)
-      } catch (err) {
-        setError(err instanceof Error ? err.message : 'Failed to load event history')
-      } finally {
-        setLoading(false)
-        setLoadingMore(false)
-      }
-    },
-    [stellarService, tokenAddress],
-  )
+      setEvents(result.events)
+      setRetentionDays(result.retentionLimited ? result.retentionDays : null)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to load event history')
+    } finally {
+      setLoading(false)
+    }
+  }, [stellarService, tokenAddress])
 
   useEffect(() => {
-    cursorRef.current = null
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- loadEvents sets loading state synchronously as it starts fetching; see #1002 follow-up
     loadEvents()
   }, [loadEvents])
 
@@ -225,6 +207,16 @@ export const TokenHistory: React.FC<TokenHistoryProps> = ({ tokenAddress }) => {
     )
   }
 
+  const retentionNotice = retentionDays !== null && (
+    <p
+      role="note"
+      className="mt-4 text-xs text-gray-500 dark:text-gray-400 border-t border-gray-200 dark:border-gray-700 pt-3"
+    >
+      Event history is limited by the RPC provider&apos;s retention window. Events older than about{' '}
+      {retentionDays} days are not available from this RPC and are not shown here.
+    </p>
+  )
+
   if (events.length === 0) {
     return (
       <Card title="Token History">
@@ -233,6 +225,7 @@ export const TokenHistory: React.FC<TokenHistoryProps> = ({ tokenAddress }) => {
             No events found for this token yet.
           </p>
         </div>
+        {retentionNotice}
       </Card>
     )
   }
@@ -274,18 +267,7 @@ export const TokenHistory: React.FC<TokenHistoryProps> = ({ tokenAddress }) => {
         ))}
       </div>
 
-      {hasMore && (
-        <div className="mt-4 text-center">
-          <Button
-            onClick={() => loadEvents(true)}
-            variant="outline"
-            size="sm"
-            disabled={loadingMore}
-          >
-            {loadingMore ? <Spinner size="sm" label="Loading..." /> : 'Load More'}
-          </Button>
-        </div>
-      )}
+      {retentionNotice}
     </Card>
   )
 }

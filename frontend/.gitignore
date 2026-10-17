@@ -19,3 +19,7 @@ coverage/
 
 # OS
 .DS_Store
+
+# Playwright artifacts
+test-results/
+playwright-report/

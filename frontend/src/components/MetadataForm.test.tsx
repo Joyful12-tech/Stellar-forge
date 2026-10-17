@@ -1,7 +1,8 @@
-import { render, screen, fireEvent } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { TosProvider } from '../context/TosContext'
 import { MetadataForm } from './MetadataForm'
+import { makeImageFile, PNG_HEADER } from '../test/imageFixtures'
 
 vi.mock('../context/StellarContext', () => ({
   useStellarContext: () => ({
@@ -26,9 +27,24 @@ vi.mock('../hooks/useBalanceCheck', () => ({
   useBalanceCheck: () => ({ hasSufficientBalance: true, shortfall: 0, isTestnet: true }),
 }))
 
-vi.mock('../config/env', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('../config/env')>()),
-  isIpfsConfigured: () => true,
+// MetadataForm now reads the connected wallet for upload auth; supply one.
+vi.mock('../context/WalletContext', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../context/WalletContext')>()),
+  useWalletContext: () => ({
+    wallet: { address: 'GTESTWALLETADDRESS', isConnected: true, balance: undefined },
+    isConnecting: false,
+    error: null,
+    isInstalled: true,
+    connect: vi.fn(),
+    disconnect: vi.fn(),
+    refreshBalance: vi.fn(),
+  }),
+}))
+
+// Upload availability is server state now, not build config: the form asks
+// GET /api/health/ipfs via useIpfsReady().
+vi.mock('../hooks/useIpfsReady', () => ({
+  useIpfsReady: () => 'ready',
 }))
 
 const renderMetadataForm = () =>
@@ -43,7 +59,7 @@ describe('MetadataForm ToS gate', () => {
     localStorage.clear()
   })
 
-  it('requires accepting the terms before showing the on-chain metadata confirmation', () => {
+  it('requires accepting the terms before showing the on-chain metadata confirmation', async () => {
     const { container } = renderMetadataForm()
 
     fireEvent.change(screen.getByLabelText(/token address/i), {
@@ -54,9 +70,14 @@ describe('MetadataForm ToS gate', () => {
     expect(fileInput).not.toBeNull()
     fireEvent.change(fileInput!, {
       target: {
-        files: [new File(['token image'], 'token.png', { type: 'image/png' })],
+        // Content-based validation now runs on selection, so the fixture
+        // needs a real PNG signature.
+        files: [makeImageFile(PNG_HEADER, 'token.png', 'image/png')],
       },
     })
+
+    // Selection is validated asynchronously; wait for the accepted preview.
+    await waitFor(() => expect(screen.getByAltText(/token preview/i)).toBeInTheDocument())
 
     fireEvent.click(screen.getByRole('button', { name: /set metadata/i }))
 

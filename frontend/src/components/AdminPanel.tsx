@@ -4,8 +4,9 @@ import { useWalletContext } from '../context/WalletContext'
 import { useStellarContext } from '../context/StellarContext'
 import { useToast } from '../context/ToastContext'
 import { useFactoryState } from '../hooks/useFactoryState'
-import { useTransaction } from '../hooks/useTransaction'
+import { useTransaction, isTransactionInFlight } from '../hooks/useTransaction'
 import { useNetworkGuard } from '../hooks/useNetworkGuard'
+import { NetworkGuardAlert } from './NetworkGuardAlert'
 
 // Stroops → display XLM (7 decimals)
 function stroopsToDisplay(stroops: string): string {
@@ -27,12 +28,17 @@ export const AdminPanel: React.FC = () => {
   const { stellarService } = useStellarContext()
   const { addToast } = useToast()
   const { state, isLoading: stateLoading, refetch } = useFactoryState()
-  const { blocked: networkBlocked, reason: networkReason } = useNetworkGuard()
+  const networkGuard = useNetworkGuard()
+  const networkBlocked = networkGuard.blocked
 
   const [baseFee, setBaseFee] = useState('')
   const [metadataFee, setMetadataFee] = useState('')
   const [errors, setErrors] = useState<{ baseFee?: string; metadataFee?: string }>({})
   const [showConfirm, setShowConfirm] = useState(false)
+
+  // Whitelist toggle state
+  const [whitelistEnabled, setWhitelistEnabled] = useState(false)
+  const [whitelistPending, setWhitelistPending] = useState(false)
 
   const feesRef = useRef({ baseFee: '', metadataFee: '' })
 
@@ -46,11 +52,7 @@ export const AdminPanel: React.FC = () => {
   )
 
   const { execute, status: txStatus } = useTransaction(feeBuilder)
-  const isPending =
-    txStatus === 'simulating' ||
-    txStatus === 'signing' ||
-    txStatus === 'submitting' ||
-    txStatus === 'polling'
+  const isPending = isTransactionInFlight(txStatus)
 
   // Pre-populate form once factory state loads
   useEffect(() => {
@@ -58,6 +60,7 @@ export const AdminPanel: React.FC = () => {
       // eslint-disable-next-line react-hooks/set-state-in-effect -- syncing form fields from async-loaded factory state
       setBaseFee(stroopsToDisplay(state.baseFee))
       setMetadataFee(stroopsToDisplay(state.metadataFee))
+      setWhitelistEnabled(state.whitelistEnabled ?? false)
     }
   }, [state])
 
@@ -116,6 +119,26 @@ export const AdminPanel: React.FC = () => {
     }
   }
 
+  async function handleWhitelistToggle() {
+    const next = !whitelistEnabled
+    setWhitelistPending(true)
+    try {
+      await stellarService.setWhitelistEnabled(next)
+      setWhitelistEnabled(next)
+      addToast(
+        next
+          ? 'Whitelist enforcement enabled. Only whitelisted addresses may create tokens.'
+          : 'Whitelist enforcement disabled. Factory is open to all creators.',
+        'success',
+      )
+      refetch()
+    } catch (err) {
+      addToast(err instanceof Error ? err.message : 'Transaction failed.', 'error')
+    } finally {
+      setWhitelistPending(false)
+    }
+  }
+
   return (
     <div className="max-w-lg mx-auto space-y-6">
       <h2 className="text-2xl font-bold text-gray-900 dark:text-white">Admin Panel</h2>
@@ -157,12 +180,53 @@ export const AdminPanel: React.FC = () => {
           {isPending ? 'Submitting…' : 'Submit Changes'}
         </Button>
 
-        {networkBlocked && networkReason && (
-          <p className="mt-2 text-sm text-red-600 dark:text-red-400" role="alert">
-            {networkReason}
+        <NetworkGuardAlert guard={networkGuard} className="mt-2" />
+      </form>
+
+      {/* ── Whitelist enforcement toggle ─────────────────────────────────── */}
+      <div className="border border-gray-200 dark:border-gray-700 rounded-lg p-4 space-y-3">
+        <div className="flex items-center justify-between">
+          <div>
+            <h3 className="text-sm font-semibold text-gray-900 dark:text-white">
+              Whitelist Enforcement
+            </h3>
+            <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+              {whitelistEnabled
+                ? 'Enabled — only whitelisted addresses can create tokens.'
+                : 'Disabled — all addresses can create tokens (open factory).'}
+            </p>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={whitelistEnabled}
+            aria-label="Toggle whitelist enforcement"
+            disabled={whitelistPending || networkBlocked}
+            onClick={handleWhitelistToggle}
+            className={[
+              'relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent',
+              'transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2',
+              'disabled:opacity-50 disabled:cursor-not-allowed',
+              whitelistEnabled ? 'bg-blue-600 dark:bg-blue-500' : 'bg-gray-200 dark:bg-gray-600',
+            ].join(' ')}
+          >
+            <span
+              aria-hidden="true"
+              className={[
+                'pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0',
+                'transition duration-200 ease-in-out',
+                whitelistEnabled ? 'translate-x-5' : 'translate-x-0',
+              ].join(' ')}
+            />
+          </button>
+        </div>
+        {whitelistPending && (
+          <p className="text-xs text-blue-600 dark:text-blue-400 animate-pulse">
+            Submitting whitelist toggle transaction…
           </p>
         )}
-      </form>
+        <NetworkGuardAlert guard={networkGuard} compact />
+      </div>
 
       <ConfirmModal
         isOpen={showConfirm}

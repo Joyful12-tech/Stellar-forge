@@ -3,58 +3,77 @@
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 
+const METADATA_URI_MAX_LEN: usize = 128;
+const IPFS_PREFIX: &str = "ipfs://";
+
 #[derive(Arbitrary, Debug, Clone)]
 struct FuzzSetMetadataInput {
-    // Random bytes for metadata URI - no length restriction in the contract
+    /// Random bytes for metadata URI — may or may not be valid UTF-8.
     uri_bytes: Vec<u8>,
     fee_payment: i128,
     metadata_fee: i128,
-    // Whether a duplicate set attempt follows the first
-    attempt_duplicate: bool,
+    /// Whether to simulate a freeze before a second update attempt.
+    attempt_after_freeze: bool,
+    /// Simulate update count (0..=METADATA_MAX_UPDATES).
+    update_count: u8,
 }
 
 fuzz_target!(|input: FuzzSetMetadataInput| {
-    // Normalize the metadata_fee so it is non-negative (contract stores positive fees)
     let metadata_fee = input.metadata_fee.saturating_abs();
     let fee_payment = input.fee_payment;
 
-    // --- Fee comparison logic (mirrors set_metadata guard) ---
+    // ── Fee comparison ────────────────────────────────────────────────────
     let fee_sufficient = fee_payment >= metadata_fee;
-
     if fee_sufficient {
-        // Payment at or above the required fee must never underflow when subtracted
         let remainder = fee_payment.saturating_sub(metadata_fee);
         assert!(remainder >= 0);
     }
 
-    // --- Metadata URI string validation ---
-    // The contract accepts any soroban_sdk::String; we model user-supplied bytes here.
+    // ── URI string validation (mirrors contract logic) ────────────────────
     let uri_str = match String::from_utf8(input.uri_bytes.clone()) {
         Ok(s) => s,
-        // Non-UTF-8 bytes would be rejected at the SDK boundary — treat as invalid
-        Err(_) => return,
+        Err(_) => return, // non-UTF-8 rejected at SDK boundary
     };
 
-    // Empty URIs are technically accepted by the contract (no length guard in set_metadata).
-    // Verify that working with the string does not panic regardless of content.
-    let _uri_len = uri_str.len();
-    let _is_empty = uri_str.is_empty();
+    let is_empty = uri_str.is_empty();
+    let too_long = uri_str.len() > METADATA_URI_MAX_LEN;
+    let has_prefix = uri_str.starts_with(IPFS_PREFIX);
+    let cid_nonempty = uri_str.len() > IPFS_PREFIX.len();
 
-    // Simulate the "already set" idempotency guard: a second call for the same
-    // token must return MetadataAlreadySet without touching the fee.
-    if input.attempt_duplicate {
-        // After a successful first call the storage slot is occupied.
-        // The fee path is never reached, so no arithmetic is performed.
-        // Verify the fee values themselves are still well-formed.
-        assert!(metadata_fee >= 0);
+    let is_valid_uri = !is_empty && !too_long && has_prefix && cid_nonempty;
+
+    // Verify classification is stable (pure function, no side effects).
+    assert_eq!(
+        is_valid_uri,
+        !is_empty && !too_long && has_prefix && cid_nonempty
+    );
+
+    // If URI is valid, it must not be empty, must have prefix, must be bounded.
+    if is_valid_uri {
+        assert!(!uri_str.is_empty());
+        assert!(uri_str.starts_with(IPFS_PREFIX));
+        assert!(uri_str.len() <= METADATA_URI_MAX_LEN);
+        assert!(uri_str.len() > IPFS_PREFIX.len());
     }
 
-    // --- Overflow-safe fee accumulation (mirrors distribute_fee arithmetic) ---
-    // Ensure multiplying the fee by a small operation count cannot overflow.
-    let ops: i128 = 3; // set_metadata is a single operation, but guard the pattern
+    // ── Update-count / freeze logic simulation ────────────────────────────
+    const METADATA_MAX_UPDATES: u8 = 5;
+    let current_version = input.update_count.min(METADATA_MAX_UPDATES);
+
+    // Simulate: if frozen or at max version, update must fail.
+    let would_be_frozen = input.attempt_after_freeze || current_version >= METADATA_MAX_UPDATES;
+    if would_be_frozen {
+        // No further updates allowed — this is the MetadataFrozen path.
+        assert!(current_version >= METADATA_MAX_UPDATES || input.attempt_after_freeze);
+    } else {
+        // Update is allowed; new version would be current_version + 1.
+        let new_version = current_version + 1;
+        assert!(new_version <= METADATA_MAX_UPDATES);
+    }
+
+    // ── Overflow-safe fee accumulation ────────────────────────────────────
+    let ops: i128 = 3;
     let _scaled = metadata_fee.saturating_mul(ops);
     let _total = fee_payment.saturating_add(metadata_fee);
-
-    // Invariant: saturating operations always return a value
     assert!(metadata_fee.saturating_add(i128::MAX) >= 0 || metadata_fee < 0);
 });

@@ -40,7 +40,7 @@ vi.mock('../services/stellar', () => ({
   stellarService: {},
   StellarService: vi.fn().mockImplementation(() => ({
     getContractEvents: vi.fn().mockResolvedValue({ events: [], cursor: null }),
-    getAllTokens: vi.fn().mockResolvedValue([]),
+    getAllTokens: vi.fn().mockResolvedValue({ tokens: [], total: 0 }),
     getFactoryState: vi.fn().mockResolvedValue({
       baseFee: '0',
       metadataFee: '0',

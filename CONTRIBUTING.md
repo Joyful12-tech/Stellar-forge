@@ -15,6 +15,7 @@ Thank you for your interest in contributing to StellarForge! This document provi
 - [Adding a New Language](#adding-a-new-language)
 - [SDK Upgrade Process](#sdk-upgrade-process)
 - [Security](#security)
+- [Dependabot Auto-merge Policy](#dependabot-auto-merge-policy)
 - [Getting Help](#getting-help)
 
 ## Code Quality Hooks
@@ -522,7 +523,18 @@ Closes #42"
    cargo test
    ```
 
-3. **Update documentation** if needed (README, code comments, etc.)
+3. **Check access-control drift when `contracts/token-factory/src/lib.rs` is touched**:
+
+   ```bash
+   ./scripts/check-access-control-docs-drift.sh
+   ```
+
+   Interpretation of the result:
+   - `0` — OK: the public auth claims in the contract match the documented matrix.
+   - `1` — Critical drift: fix the contract or docs before merging.
+   - `2` — Warning-only drift: review the unknown functions and keep the rationale in the PR description.
+
+4. **Update documentation** if needed (README, code comments, docs/contract-abi.md, SECURITY.md, etc.)
 
 ### Submitting a Pull Request
 
@@ -541,6 +553,7 @@ Closes #42"
    - **Testing**: Describe how you tested the changes
    - **Screenshots**: Include if UI changes are involved
    - **Checklist**: Confirm you've followed guidelines
+   - **Authorization check**: If the PR touches `contracts/token-factory/src/lib.rs` auth logic, include the result of `./scripts/check-access-control-docs-drift.sh` and confirm whether it returned `0`, `1`, or `2`
 
 ### PR Title Format
 
@@ -622,13 +635,13 @@ export function TF(props: any) {
 ```typescript
 // Good
 export function useTokenBalance(tokenId: string) {
-  const [balance, setBalance] = useState<number>(0);
+  const [balance, setBalance] = useState<number>(0)
 
   useEffect(() => {
-    fetchBalance(tokenId).then(setBalance);
-  }, [tokenId]);
+    fetchBalance(tokenId).then(setBalance)
+  }, [tokenId])
 
-  return balance;
+  return balance
 }
 ```
 
@@ -869,9 +882,9 @@ The parity check is enforced in CI and as a pre-commit hook. If you add a key to
 > **Tip:** Use the `t()` function from `react-i18next` to access translation keys in components:
 >
 > ```tsx
-> import { useTranslation } from "react-i18next";
-> const { t } = useTranslation();
-> return <button>{t("my.new.key")}</button>;
+> import { useTranslation } from 'react-i18next'
+> const { t } = useTranslation()
+> return <button>{t('my.new.key')}</button>
 > ```
 
 ## Adding a New Language
@@ -886,16 +899,16 @@ Create a new language file in `frontend/src/config/i18n/`:
 // frontend/src/config/i18n/es.ts
 export const es = {
   common: {
-    submit: "Enviar",
-    cancel: "Cancelar",
-    loading: "Cargando...",
+    submit: 'Enviar',
+    cancel: 'Cancelar',
+    loading: 'Cargando...',
   },
   tokens: {
-    create: "Crear Token",
-    name: "Nombre del Token",
+    create: 'Crear Token',
+    name: 'Nombre del Token',
   },
   // ... more translations
-};
+}
 ```
 
 ### Step 2: Register Language
@@ -903,15 +916,15 @@ export const es = {
 Update the language registry in `frontend/src/config/i18n/index.ts`:
 
 ```typescript
-import { es } from "./es";
+import { es } from './es'
 
 export const languages = {
   en: en,
   es: es,
   // ... other languages
-};
+}
 
-export type Language = keyof typeof languages;
+export type Language = keyof typeof languages
 ```
 
 ### Step 3: Update Language Selector
@@ -921,10 +934,10 @@ Update the language selector component to include the new language:
 ```typescript
 // frontend/src/components/LanguageSelector.tsx
 const AVAILABLE_LANGUAGES = [
-  { code: "en", name: "English" },
-  { code: "es", name: "Español" },
+  { code: 'en', name: 'English' },
+  { code: 'es', name: 'Español' },
   // ... add new language
-];
+]
 ```
 
 ### Step 4: Test
@@ -1064,6 +1077,14 @@ Please read and follow our [Code of Conduct](CODE_OF_CONDUCT.md). By participati
 - **Use secure random generation**: For any cryptographic operations
 - **Handle errors gracefully**: Don't expose sensitive information in error messages
 
+### Dependency Advisories
+
+The Security Audit workflow runs `cargo audit` and `npm audit` on every push and pull request, and weekly. Any high-or-above advisory fails the build.
+
+If an advisory does not affect StellarForge (for example, a dev-only dependency or an attack vector we never exercise), it can be waived — but only with a written justification, a tracking issue, and a review-by date, recorded in `contracts/.cargo/audit.toml` or `frontend/audit-ci.jsonc`. Waivers expire, and the weekly job fails once they do.
+
+Never waive an advisory that does affect us, and never extend a review-by date without re-verifying the justification. See [docs/security-triage.md](docs/security-triage.md) for the full process.
+
 ### Reporting Security Vulnerabilities
 
 If you discover a security vulnerability:
@@ -1074,6 +1095,53 @@ If you discover a security vulnerability:
 4. **Allow time** for the team to respond and prepare a fix
 
 See [SECURITY.md](SECURITY.md) for detailed vulnerability reporting procedures.
+
+## Dependabot Auto-merge Policy
+
+StellarForge uses [Dependabot](https://docs.github.com/en/code-security/dependabot) to keep npm, Cargo, and GitHub Actions dependencies up to date. To prevent known-vulnerable dependencies from accumulating unreviewed, we apply an automated merge policy based on the semver impact of each update.
+
+### Coverage
+
+Dependabot is configured to watch three separate dependency trees:
+
+| Directory                       | Ecosystem      | Lockfile                                  |
+| ------------------------------- | -------------- | ----------------------------------------- |
+| `/frontend`                     | npm            | `frontend/package-lock.json`              |
+| `/contracts`                    | Cargo          | `contracts/Cargo.lock`                    |
+| `/contracts/token-factory/fuzz` | Cargo          | `contracts/token-factory/fuzz/Cargo.lock` |
+| `/`                             | GitHub Actions | n/a                                       |
+
+The fuzz workspace is listed as a **separate** Cargo entry because it has its own `[workspace]` and lockfile. Without its own entry, its transitive dependencies (`libfuzzer-sys`, `arbitrary`, etc.) would never receive Dependabot PRs and would fall silently behind the main workspace's audit coverage.
+
+### Merge rules
+
+| Update type               | Action                                                                                                   |
+| ------------------------- | -------------------------------------------------------------------------------------------------------- |
+| **Patch** (`x.y.Z`, 1.0+) | Auto-merged once all required CI checks pass. No human review needed.                                    |
+| **Minor** (`x.Y.z`, 1.0+) | Auto-merged once all required CI checks pass. No human review needed.                                    |
+| **Major** (`X.y.z`)       | Requires **manual review and approval**. A bot comment on the PR explains what to check.                 |
+| **Pre-1.0** (`0.x`)       | Requires **manual review and approval** regardless of patch/minor. A bot comment on the PR explains why. |
+
+A package is treated as pre-1.0 when the _new_ version reported by Dependabot starts with `0.` (or `v0.`, for action tags). Such updates never auto-merge: below `1.0`, semver provides no non-breaking guarantee, so a `0.x` "minor" may legitimately ship breaking changes, and young `0.x` packages are also more exposed to a compromised upstream publishing a malicious patch/minor release. Routing them to human review restores a person in the loop for exactly the updates that most need it.
+
+Auto-merge is implemented in `.github/workflows/dependabot-auto-merge.yml` using GitHub's native `gh pr merge --auto --squash`. The merge only executes after branch-protection required checks (CI, security audit, lint) all pass — auto-merge never bypasses CI.
+
+### Package-age and provenance gates
+
+Two additional, complementary defenses were evaluated but are **not yet automated**:
+
+1. **Package-age gate** — requiring a minimum time-since-publish before auto-merge would give the ecosystem time to catch an obviously-malicious release. `dependabot/fetch-metadata` does not expose publish timestamps, so this would need a per-ecosystem registry lookup (npm registry, crates.io, GitHub tags) that is non-trivial to implement reliably and would slow or throttle every PR. The `0.x` gate above provides a partial substitute, since pre-1.0 releases skew young.
+2. **Provenance / OpenSSF Scorecard signal** — gating on npm provenance attestations or a Scorecard score would raise the bar against compromised upstream pipelines, but consuming those signals (and defining a threshold that does not silently block legitimate updates) is a larger design effort.
+
+These remain open follow-ups; until they land, the `0.x` gate plus the existing required CI checks (which exercise the newly-updated code paths) are the enforced safeguards.
+
+### Rationale
+
+Leaving every Dependabot PR unreviewed indefinitely is a common cause of the exact "known vulnerability sits unpatched for months" problem that security scanning is meant to prevent. Patch and minor bumps in well-maintained, post-1.0 ecosystems (npm, Cargo) have a very low rate of user-facing breakage and a high rate of security fixes; automating them moves the risk needle in the right direction. Major bumps carry real API-breakage risk, and pre-1.0 packages carry both breaking-change and supply-chain risk, so both always require a human to review the upstream change.
+
+### Waivers
+
+If a patch or minor update breaks something despite passing CI (e.g., a subtle runtime regression), revert the merge commit and open an issue. Do **not** disable the auto-merge workflow globally — instead, add the specific advisory or package to the waiver list (`contracts/.cargo/audit.toml` or `frontend/audit-ci.jsonc`) with a justification and a review-by date, as documented in [Security](#security) above.
 
 ## Getting Help
 

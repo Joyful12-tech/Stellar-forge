@@ -5,6 +5,15 @@
  * - No PII, no wallet addresses, no personal data is ever sent.
  * - All tracking is skipped when the user has opted out.
  * - All tracking is skipped when VITE_PLAUSIBLE_DOMAIN is not configured.
+ *
+ * Opt-out semantics (regulatory compliance — GDPR/CCPA):
+ * - isOptedOut() reads localStorage on every call, so opt-out takes effect
+ *   IMMEDIATELY within the current session — no page reload is required.
+ * - This satisfies the requirement that a user who opts out mid-session must
+ *   have their preference honoured instantly, not deferred to the next load.
+ * - All code that needs to fire analytics events MUST call trackEvent() or
+ *   trackPageView() from this module — direct use of window.plausible bypasses
+ *   the consent check and is flagged by the CI lint rule (scripts/check-analytics-bypass.mjs).
  */
 
 const OPT_OUT_KEY = 'analytics_opt_out'

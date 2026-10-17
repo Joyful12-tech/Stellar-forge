@@ -1,7 +1,7 @@
 // Stellar SDK integration service
 import { STELLAR_CONFIG, NETWORK_CONFIGS } from '../config/stellar'
 import { walletService } from './wallet'
-import { captureContractError } from '../lib/monitoring/sentry'
+import { captureContractError, type ContractErrorContext } from '../lib/monitoring/sentry'
 import type {
   AppError,
   ContractEvent,
@@ -9,9 +9,12 @@ import type {
   DeploymentResult,
   FactoryState,
   GetEventsResult,
+  TokenEventsResult,
   TokenInfo,
+  TokenInfoResult,
 } from '../types'
 import {
+  Account,
   Contract,
   TransactionBuilder,
   Networks,
@@ -27,8 +30,22 @@ import {
 } from 'stellar-sdk'
 import type { Network } from '../config/stellar'
 import { withRetry, HttpError } from '../utils/retry'
+import { fetchAllContractEvents } from '../utils/fetchAllContractEvents'
 import { parseContractError } from '../utils/contractErrors'
-import { nextBackoffDelay } from '../utils/pollWithBackoff'
+import { contractErrorCodeFromScVal } from '../utils/transactionResult'
+import {
+  submitAndConfirm,
+  TransactionSubmissionError,
+  type SubmitAndConfirmResult,
+  type SubmitOptions,
+  type TransactionLifecycleStatus,
+} from './transactionSubmission'
+
+export {
+  TransactionSubmissionError,
+  type TransactionFailureStatus,
+  type TransactionLifecycleStatus,
+} from './transactionSubmission'
 
 export type { FactoryState } from '../types'
 
@@ -45,10 +62,111 @@ function hexToBytes(hex: string): Uint8Array {
   return bytes
 }
 
+/** Lowercase hex, the form `stellar contract install` and explorers print. */
+function bytesToHex(bytes: Iterable<number>): string {
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')
+}
+
+/** Build the retryable {@link HttpError} for a non-OK Horizon/RPC response. */
+function httpErrorFromResponse(res: Response, message: string): HttpError {
+  const retryAfter = res.headers.get('Retry-After')
+  return new HttpError(res.status, message, retryAfter ? parseInt(retryAfter, 10) : undefined)
+}
+
+function requireFactoryContractId(): string {
+  const contractId = STELLAR_CONFIG.factoryContractId
+  if (!contractId) throw new Error('Factory contract ID is not configured')
+  return contractId
+}
+
+function requireConnectedAddress(): string {
+  const sourceAddress = walletService.getConnectedAddress()
+  if (!sourceAddress) throw new Error('Wallet not connected')
+  return sourceAddress
+}
+
+/**
+ * Encode a Rust `Option<i128>` contract argument.
+ *
+ * Soroban does not represent `Option<T>` as a tagged union on the wire: `None`
+ * is the plain `Void` ScVal and `Some(v)` is the inner value *itself*, with no
+ * wrapper (see soroban-env-common's `TryFromVal<E, Option<T>> for Val`, which
+ * returns `Val::VOID` for `None` and `t.try_into_val(env)` for `Some`).
+ * Wrapping the value in a `["Some", v]` vector — the encoding used for
+ * `#[contracttype]` enum variants — makes the host's `Option` decode fail,
+ * because a non-void value is handed straight to `i128`'s converter.
+ *
+ * `null`, `undefined` and `''` all encode as `None`.
+ */
+function optionI128(value: string | null | undefined): xdr.ScVal {
+  if (value === null || value === undefined || value === '') {
+    return xdr.ScVal.scvVoid()
+  }
+  return nativeToScVal(BigInt(value), { type: 'i128' })
+}
+
 /** Convert a raw error into the project's AppError shape. */
 function toAppError(err: unknown): AppError {
   const parsed = parseContractError(err)
   return { code: 'CONTRACT_ERROR', message: parsed.message }
+}
+
+/**
+ * Map a raw error to the one thrown to callers.
+ *
+ * A {@link TransactionSubmissionError} is passed through unchanged: its message
+ * is already user-facing and, crucially, its `status`/`safeToRetry` fields tell
+ * the UI whether re-signing could double-execute the call. Flattening it into a
+ * plain `Error` (as every write path used to) discarded exactly that.
+ */
+function toUserFacingError(err: unknown): Error {
+  if (err instanceof TransactionSubmissionError) return err
+  return new Error(toAppError(err).message)
+}
+
+/**
+ * Default page size for `getAllTokens` when a caller does not specify one.
+ * Mirrors the Token Explorer / dashboard default so the first page maps to a
+ * single index-range fetch.
+ */
+const DEFAULT_TOKEN_PAGE_LIMIT = 10
+
+/**
+ * Maximum number of `get_token_info` view calls kept in flight at once while
+ * assembling one page of the global token list. The SDF publishes no static
+ * RPC rate limit and throttles dynamically (see docs/rpc-rate-limits.md), so
+ * we stay deliberately conservative — a single page never bursts more than
+ * this many simultaneous simulations at the endpoint.
+ */
+const GET_ALL_TOKENS_CONCURRENCY = 5
+
+/**
+ * Resolve `tasks` with at most `limit` running concurrently, preserving input
+ * order. Uses `Promise.allSettled` semantics: every task settles and the
+ * caller decides how to treat rejections, so one failing index read never
+ * rejects the whole batch.
+ */
+async function allSettledWithConcurrency<T>(
+  tasks: Array<() => Promise<T>>,
+  limit: number,
+): Promise<PromiseSettledResult<T>[]> {
+  const results = new Array<PromiseSettledResult<T>>(tasks.length)
+  let nextIndex = 0
+
+  async function worker() {
+    while (nextIndex < tasks.length) {
+      const i = nextIndex++
+      try {
+        results[i] = { status: 'fulfilled', value: await tasks[i]!() }
+      } catch (reason) {
+        results[i] = { status: 'rejected', reason }
+      }
+    }
+  }
+
+  const workerCount = Math.max(1, Math.min(limit, tasks.length))
+  await Promise.all(Array.from({ length: workerCount }, worker))
+  return results
 }
 
 // ── Network helpers ───────────────────────────────────────────────────────────
@@ -70,18 +188,22 @@ function getRpcServer(network: Network): rpc.Server {
 // ── Transaction lifecycle ─────────────────────────────────────────────────────
 
 /**
- * Simulate, sign via Freighter, submit, and poll until confirmed.
- * Returns the transaction hash on success.
+ * Simulate, sign via Freighter, submit, and wait for a definitive verdict.
+ * Returns the transaction hash on confirmed inclusion.
  *
- * Both simulation and submission are wrapped with retry logic so that
- * transient failures (including 429 rate-limit responses) are handled
- * with exponential backoff before the user sees an error.
+ * Simulation is wrapped with retry logic so that transient failures (including
+ * 429 rate-limit responses) are handled with exponential backoff. Submission
+ * and inclusion tracking are delegated to `transactionSubmission`, which gives
+ * every `sendTransaction` status its own path and rejects with a typed
+ * {@link TransactionSubmissionError} (`dropped` / `expired` / `failed` /
+ * `unconfirmed`) instead of a generic attempt-count timeout.
  */
-async function simulateAndSubmit(
+async function simulateAndSubmitDetailed(
   server: rpc.Server,
   tx: ReturnType<TransactionBuilder['build']>,
   network: Network,
-): Promise<string> {
+  onStatus?: (status: TransactionLifecycleStatus) => void,
+): Promise<SubmitAndConfirmResult> {
   const simResult = await withRetry(() => server.simulateTransaction(tx))
 
   if (rpc.Api.isSimulationError(simResult)) {
@@ -93,41 +215,16 @@ async function simulateAndSubmit(
 
   const assembled = rpc.assembleTransaction(tx, simResult).build()
   const signedXdr = await walletService.signTransaction(assembled.toXDR(), network)
+  const signedTx = TransactionBuilder.fromXDR(signedXdr, getNetworkPassphrase(network))
 
-  const submitResult = await withRetry(() =>
-    server.sendTransaction(TransactionBuilder.fromXDR(signedXdr, getNetworkPassphrase(network))),
-  )
-
-  if (submitResult.status === 'ERROR') {
-    throw parseContractError(
-      new Error(submitResult.errorResult?.toXDR('base64') ?? 'Submission failed'),
-    )
-  }
-
-  await pollTransaction(server, submitResult.hash)
-  return submitResult.hash
+  const options: SubmitOptions = onStatus ? { onStatus } : {}
+  return submitAndConfirm(server, signedTx, options)
 }
 
-async function pollTransaction(
-  server: rpc.Server,
-  hash: string,
-  maxAttempts = 20,
-  initialDelayMs = 500,
-  maxDelayMs = 4_000,
-): Promise<rpc.Api.GetTransactionResponse> {
-  for (let i = 0; i < maxAttempts; i++) {
-    const result = (await withRetry(() =>
-      server.getTransaction(hash),
-    )) as rpc.Api.GetTransactionResponse
-    if (result.status === rpc.Api.GetTransactionStatus.SUCCESS) return result
-    if (result.status === rpc.Api.GetTransactionStatus.FAILED) {
-      throw parseContractError(new Error(`Transaction failed: ${hash}`))
-    }
-    const delay = nextBackoffDelay(i, { initialDelayMs, maxDelayMs })
-    await new Promise((r) => setTimeout(r, delay))
-  }
-  throw new Error(`Transaction ${hash} timed out after ${maxAttempts} attempts`)
-} // ── Fee Bump Transactions ─────────────────────────────────────────────────────
+/** Result selector for write calls whose callers only need the hash. */
+const selectHash = ({ hash }: SubmitAndConfirmResult): string => hash
+
+// ── Fee Bump Transactions ─────────────────────────────────────────────────────
 
 /**
  * Wrap a signed inner transaction in a fee bump envelope.
@@ -151,11 +248,17 @@ export async function buildFeeBumpTransaction(
 }
 
 /**
- * Submit a signed fee bump transaction and wait for confirmation.
+ * Submit a signed fee bump transaction and wait for a definitive verdict.
+ *
+ * Shares the submission path with `simulateAndSubmit`, so a fee bump gets the
+ * same explicit handling of every `sendTransaction` status — including
+ * TRY_AGAIN_LATER resubmission of the identical signed envelope — and the same
+ * timebounds-derived expiry verdict (read from the inner transaction).
  */
 export async function submitFeeBumpTransaction(
   signedFeeBumpXdr: string,
   network: Network,
+  onStatus?: (status: TransactionLifecycleStatus) => void,
 ): Promise<string> {
   const server = getRpcServer(network)
   const feeBumpTx = TransactionBuilder.fromXDR(
@@ -163,14 +266,9 @@ export async function submitFeeBumpTransaction(
     getNetworkPassphrase(network),
   ) as FeeBumpTransaction
 
-  const submitResult = await withRetry(() => server.sendTransaction(feeBumpTx))
-  if (submitResult.status === 'ERROR') {
-    throw parseContractError(
-      new Error(submitResult.errorResult?.toXDR('base64') ?? 'Fee bump submission failed'),
-    )
-  }
-  await pollTransaction(server, submitResult.hash)
-  return submitResult.hash
+  const options: SubmitOptions = onStatus ? { onStatus } : {}
+  const { hash } = await submitAndConfirm(server, feeBumpTx, options)
+  return hash
 }
 
 // ── Shared builder helper ─────────────────────────────────────────────────────
@@ -189,24 +287,20 @@ async function buildTxBuilder(
 
 // ── View function helper ──────────────────────────────────────────────────────
 
-/**
- * Call a read-only contract function via simulation (no signing required).
- */
-async function callView(
+/** Simulate `method` from `account` and return its return value. */
+async function simulateView(
   server: rpc.Server,
+  account: Account,
   contractId: string,
   method: string,
   args: xdr.ScVal[],
-  sourceAddress: string,
   network: Network,
 ): Promise<xdr.ScVal> {
-  const contract = new Contract(contractId)
-  const account = await withRetry(() => server.getAccount(sourceAddress))
   const tx = new TransactionBuilder(account, {
     fee: BASE_FEE,
     networkPassphrase: getNetworkPassphrase(network),
   })
-    .addOperation(contract.call(method, ...args))
+    .addOperation(new Contract(contractId).call(method, ...args))
     .setTimeout(30)
     .build()
 
@@ -220,9 +314,65 @@ async function callView(
   return simResult.result.retval
 }
 
+/**
+ * Call a read-only contract function via simulation (no signing required).
+ */
+async function callView(
+  server: rpc.Server,
+  contractId: string,
+  method: string,
+  args: xdr.ScVal[],
+  sourceAddress: string,
+  network: Network,
+): Promise<xdr.ScVal> {
+  const account = await withRetry(() => server.getAccount(sourceAddress))
+  return simulateView(server, account, contractId, method, args, network)
+}
+
+/**
+ * Approximate window (in days) that public Soroban RPC infrastructure retains
+ * contract events for. `getEvents` cannot return events older than this, so any
+ * event-derived history is inherently partial and must be disclosed as such
+ * rather than presented as a token's complete lifetime. See
+ * `docs/rpc-rate-limits.md` for the retention constraint.
+ */
+export const RPC_EVENT_RETENTION_DAYS = 7
+
+/**
+ * Placeholder source account for read-only view simulations. Soroban's
+ * `simulateTransaction` does not require the source account to exist or be
+ * funded for invocations that require no authorization, so token identity can
+ * be resolved without a connected wallet. This is the canonical all-zero
+ * ed25519 account (`StrKey.encodeEd25519PublicKey(new Uint8Array(32))`), a
+ * valid — if unfunded — StrKey, hardcoded to avoid a Buffer dependency.
+ */
+const READONLY_SOURCE_ACCOUNT = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF'
+
+/**
+ * Call a read-only contract view via simulation without requiring a connected
+ * wallet. Unlike {@link callView}, the source account is not fetched from the
+ * network (a placeholder is used) so anonymous page loads can resolve token
+ * data. The connected wallet address is used when available so simulations are
+ * attributed to a real account, but it is never required.
+ */
+async function callViewReadonly(
+  server: rpc.Server,
+  contractId: string,
+  method: string,
+  args: xdr.ScVal[],
+  network: Network,
+): Promise<xdr.ScVal> {
+  const source = walletService.getConnectedAddress() ?? READONLY_SOURCE_ACCOUNT
+  // Sequence number is irrelevant for a read-only simulation; a locally
+  // constructed account avoids an extra `getAccount` round-trip and works even
+  // when `source` has never been funded on-chain.
+  const account = new Account(source, '0')
+  return simulateView(server, account, contractId, method, args, network)
+}
+
 // ── Raw RPC types ─────────────────────────────────────────────────────────────
 
-interface RpcEventResponse {
+export interface RpcEventResponse {
   id: string
   type: string
   ledger: number
@@ -251,9 +401,7 @@ function scValToString(val: xdr.ScVal | undefined): string {
       if (addr.switch() === xdr.ScAddressType.scAddressTypeAccount()) {
         return StrKey.encodeEd25519PublicKey(addr.accountId().ed25519())
       }
-      return Array.from(addr.contractId() as Uint8Array)
-        .map((b) => b.toString(16).padStart(2, '0'))
-        .join('')
+      return bytesToHex(addr.contractId() as Uint8Array)
     }
     if (type === xdr.ScValType.scvI128()) {
       const hi = BigInt(val.i128().hi().toString())
@@ -268,6 +416,21 @@ function scValToString(val: xdr.ScVal | undefined): string {
     if (type === xdr.ScValType.scvVec()) {
       return (val.vec() ?? []).map((v) => scValToString(v)).join(', ')
     }
+    // BytesN<N> payloads (WASM hashes, salts) are identifiers operators compare
+    // against `stellar contract install` output and explorer pages, both of
+    // which print lowercase hex. Base64 would be unrecognisable there.
+    if (type === xdr.ScValType.scvBytes()) {
+      return bytesToHex(val.bytes() as unknown as Uint8Array)
+    }
+    // An error value in an event payload is readable data, not an opaque blob:
+    // render the contract code rather than re-serialising it to base64.
+    if (type === xdr.ScValType.scvError()) {
+      const code = contractErrorCodeFromScVal(val)
+      if (code !== undefined) return `Error(Contract, ${code})`
+      return val.error().switch().name
+    }
+    // Last resort for a value type this helper does not model. Not an error
+    // path — nothing here is shown to a user as a failure reason.
     return val.toXDR('base64')
   } catch {
     return ''
@@ -276,67 +439,131 @@ function scValToString(val: xdr.ScVal | undefined): string {
 
 // ── Event parsing ─────────────────────────────────────────────────────────────
 
-const EVENT_TOPICS: ContractEventType[] = [
-  'init',
-  'created',
-  'meta',
-  'mint',
-  'burn',
-  'fees',
-  'pause',
-  'unpause',
-  'admin_update',
-]
+/**
+ * Single source of truth that maps every contract symbol_short! topic value to
+ * its ContractEventType.  The allow-list and the parser both derive from this
+ * table, so they can never drift apart.
+ *
+ * Contract topics are verified against lib.rs symbol_short! calls by
+ * scripts/check-event-topic-drift.sh (CI).  If you add a new event to the
+ * contract, add it here first — the CI script will catch any omission.
+ *
+ * `meta_frz`, `split_set` and `split_clr` are privileged mutations that the
+ * contract has always emitted but the frontend used to drop on the floor,
+ * leaving holes in the audit trail this table is supposed to reconstruct
+ * (issue #917).
+ *
+ * Admin rotation is two-step, so there is no single `adm_upd` topic: the
+ * contract emits `adm_prop` when a rotation is proposed, `adm_acc` when the
+ * proposed admin accepts it, and `adm_can` when the current admin cancels a
+ * pending proposal.  `adm_dep` rides alongside `adm_prop` when the proposal
+ * came from the deprecated `transfer_admin` / `update_admin` aliases.
+ *
+ * Contract upgrades are two-step and timelocked (issue #6), so they emit three
+ * topics rather than one: `upg_prop` (hash proposed, with the ledger it becomes
+ * executable), `upg_exec` (WASM actually swapped) and `upg_can` (proposal
+ * withdrawn). Only `upg_exec` means the deployed code changed.
+ *
+ * Audit of all twenty-two contract topics (lib.rs → frontend):
+ *   init      → 'init'      (factory init)
+ *   created   → 'created'   (token deployed)
+ *   meta      → 'meta'      (metadata URI set)
+ *   meta_frz  → 'meta_frz'  (metadata frozen)
+ *   mint      → 'mint'      (tokens minted)
+ *   burn      → 'burn'      (tokens burned)
+ *   fees      → 'fees'      (fees updated)
+ *   fee_redir → 'fee_redir' (fee share redirected to treasury)
+ *   split_set → 'split_set' (fee split configured)
+ *   split_clr → 'split_clr' (fee split cleared)
+ *   pause     → 'pause'     (factory paused)
+ *   unpause   → 'unpause'   (factory unpaused)
+ *   adm_prop  → 'adm_prop'  (admin rotation proposed)
+ *   adm_acc   → 'adm_acc'   (admin rotation accepted — admin changed)
+ *   adm_can   → 'adm_can'   (pending admin rotation cancelled)
+ *   adm_dep   → 'adm_dep'   (rotation proposed via a deprecated alias)
+ *   wl_add    → 'wl_add'   (address added to whitelist)
+ *   wl_rm     → 'wl_rm'    (address removed from whitelist)
+ *   wl_tog    → 'wl_tog'   (whitelist enforcement toggled)
+ *   upg_prop  → 'upg_prop' (upgrade proposed — timelock started)
+ *   upg_exec  → 'upg_exec' (upgrade executed — factory WASM swapped)
+ *   upg_can   → 'upg_can'  (pending upgrade proposal cancelled)
+ */
+export const CONTRACT_TOPIC_MAP: Record<string, ContractEventType> = {
+  init: 'init',
+  created: 'created',
+  meta: 'meta',
+  meta_frz: 'meta_frz',
+  mint: 'mint',
+  burn: 'burn',
+  fees: 'fees',
+  fee_redir: 'fee_redir',
+  split_set: 'split_set',
+  split_clr: 'split_clr',
+  pause: 'pause',
+  unpause: 'unpause',
+  adm_prop: 'adm_prop',
+  adm_acc: 'adm_acc',
+  adm_can: 'adm_can',
+  adm_dep: 'adm_dep',
+  wl_add: 'wl_add',
+  wl_rm: 'wl_rm',
+  wl_tog: 'wl_tog',
+  upg_prop: 'upg_prop',
+  upg_exec: 'upg_exec',
+  upg_can: 'upg_can',
+} as const
 
-async function parseRpcEvent(raw: RpcEventResponse): Promise<ContractEvent | null> {
+/** Allow-list of recognised event types, derived from CONTRACT_TOPIC_MAP. */
+const EVENT_TOPICS = new Set<string>(Object.keys(CONTRACT_TOPIC_MAP))
+
+/**
+ * Names for each event's positional payload values, in contract emit order.
+ * An empty list means the payload is not decoded into `data`.
+ */
+const EVENT_PAYLOAD_FIELDS: Record<ContractEventType, readonly string[]> = {
+  init: ['admin'],
+  created: ['tokenAddress', 'creator', 'name', 'symbol'],
+  meta: ['tokenAddress', 'metadataUri'],
+  meta_frz: [],
+  mint: ['tokenAddress', 'to', 'amount'],
+  burn: ['tokenAddress', 'from', 'amount'],
+  fees: ['baseFee', 'metadataFee'],
+  fee_redir: ['recipient', 'amount'],
+  split_set: [],
+  split_clr: [],
+  pause: ['admin'],
+  unpause: ['admin'],
+  adm_prop: ['currentAdmin', 'newAdmin', 'expiryLedger'],
+  adm_acc: ['currentAdmin', 'newAdmin'],
+  adm_can: ['currentAdmin', 'cancelledAdmin'],
+  // `deprecatedEntrypoint` is the deprecated entrypoint the caller used —
+  // `transfer_admin` or `update_admin`. Neither completes the rotation;
+  // `accept_admin` must still be called before `expiryLedger`.
+  adm_dep: ['currentAdmin', 'newAdmin', 'expiryLedger', 'deprecatedEntrypoint'],
+  wl_add: ['address'],
+  wl_rm: ['address'],
+  wl_tog: ['enabled'],
+  // The upgrade cannot be executed before `readyAtLedger`. Surfacing it is the
+  // point of the timelock — it is the window in which the proposal can still
+  // be cancelled.
+  upg_prop: ['admin', 'wasmHash', 'readyAtLedger'],
+  upg_exec: ['admin', 'wasmHash'],
+  upg_can: ['admin', 'cancelledWasmHash'],
+}
+
+export async function parseRpcEvent(raw: RpcEventResponse): Promise<ContractEvent | null> {
   try {
     if (!raw.topic?.length || raw.topic.length < 2) return null
     const topicVal = xdr.ScVal.fromXDR(raw.topic[1]!, 'base64') // second topic is the action
-    const eventType = scValToString(topicVal) as ContractEventType
-    if (!EVENT_TOPICS.includes(eventType)) return null
+    const rawTopic = scValToString(topicVal)
+    if (!EVENT_TOPICS.has(rawTopic)) return null
+    const eventType = CONTRACT_TOPIC_MAP[rawTopic]!
 
     const items: xdr.ScVal[] = xdr.ScVal.fromXDR(raw.value, 'base64').vec() ?? []
     const data: Record<string, string> = {}
-
-    switch (eventType) {
-      case 'init':
-        data.admin = scValToString(items[0])
-        break
-      case 'created':
-        data.tokenAddress = scValToString(items[0])
-        data.creator = scValToString(items[1])
-        data.name = scValToString(items[2])
-        data.symbol = scValToString(items[3])
-        break
-      case 'meta':
-        data.tokenAddress = scValToString(items[0])
-        data.metadataUri = scValToString(items[1])
-        break
-      case 'mint':
-        data.tokenAddress = scValToString(items[0])
-        data.to = scValToString(items[1])
-        data.amount = scValToString(items[2])
-        break
-      case 'burn':
-        data.tokenAddress = scValToString(items[0])
-        data.from = scValToString(items[1])
-        data.amount = scValToString(items[2])
-        break
-      case 'fees':
-        data.baseFee = scValToString(items[0])
-        data.metadataFee = scValToString(items[1])
-        break
-      case 'pause':
-        data.admin = scValToString(items[0])
-        break
-      case 'unpause':
-        data.admin = scValToString(items[0])
-        break
-      case 'admin_update':
-        data.currentAdmin = scValToString(items[0])
-        data.newAdmin = scValToString(items[1])
-        break
-    }
+    EVENT_PAYLOAD_FIELDS[eventType].forEach((field, i) => {
+      data[field] = scValToString(items[i])
+    })
 
     return {
       id: raw.id,
@@ -360,14 +587,7 @@ async function rpcCall<T>(method: string, params: unknown, network: Network): Pr
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
     })
-    if (!res.ok) {
-      const retryAfter = res.headers.get('Retry-After')
-      throw new HttpError(
-        res.status,
-        `RPC HTTP error ${res.status}`,
-        retryAfter ? parseInt(retryAfter, 10) : undefined,
-      )
-    }
+    if (!res.ok) throw httpErrorFromResponse(res, `RPC HTTP error ${res.status}`)
     const json = await res.json()
     if (json.error) {
       const errorMsg: string = json.error.message ?? 'RPC error'
@@ -391,6 +611,48 @@ export class StellarService {
     this.network = network
   }
 
+  /** Report a failed call to Sentry, then throw its user-facing form. */
+  private fail(err: unknown, context: ContractErrorContext & { txHash?: string }): never {
+    const userError = toUserFacingError(err)
+    captureContractError(err instanceof Error ? err : new Error(String(err)), {
+      network: this.network,
+      ...context,
+    })
+    throw userError
+  }
+
+  /**
+   * Build, sign and submit one factory-contract invocation from the connected
+   * wallet, returning `select` applied to the confirmed result. Failures are
+   * reported under `functionName` with `params` as context.
+   */
+  private async invokeFactory<T>(
+    functionName: string,
+    params: Record<string, unknown>,
+    buildCall: (contract: Contract, sourceAddress: string) => xdr.Operation,
+    select: (result: SubmitAndConfirmResult) => T,
+  ): Promise<T> {
+    try {
+      const contractId = requireFactoryContractId()
+      const sourceAddress = requireConnectedAddress()
+      const server = getRpcServer(this.network)
+      const contract = new Contract(contractId)
+
+      const tx = (await buildTxBuilder(server, sourceAddress, this.network))
+        .addOperation(buildCall(contract, sourceAddress))
+        .setTimeout(30)
+        .build()
+
+      return select(await simulateAndSubmitDetailed(server, tx, this.network))
+    } catch (err) {
+      this.fail(err, {
+        contractId: STELLAR_CONFIG.factoryContractId ?? 'unknown',
+        functionName,
+        params,
+      })
+    }
+  }
+
   // ── deployToken ─────────────────────────────────────────────────────────────
 
   /**
@@ -402,59 +664,41 @@ export class StellarService {
     symbol: string
     decimals: number
     initialSupply: string
+    /**
+     * Optional supply cap. When provided, the token is created with a
+     * `max_supply` and `mint_tokens` will reject mints that would exceed it.
+     * Omit (or pass null/undefined) to create an uncapped token — the contract
+     * receives `Option::None`.
+     */
+    maxSupply?: string | null | undefined
     salt: string
-    tokenWasmHash: string
     feePayment: string
   }): Promise<DeploymentResult> {
-    const functionName = 'deployToken'
-    try {
-      const contractId = STELLAR_CONFIG.factoryContractId
-      if (!contractId) throw new Error('Factory contract ID is not configured')
-
-      const sourceAddress = walletService.getConnectedAddress()
-      if (!sourceAddress) throw new Error('Wallet not connected')
-
-      const server = getRpcServer(this.network)
-      const contract = new Contract(contractId)
-
-      const tx = (await buildTxBuilder(server, sourceAddress, this.network))
-        .addOperation(
-          contract.call(
-            'create_token',
-            new Address(sourceAddress).toScVal(),
-            nativeToScVal(hexToBytes(params.salt), { type: 'bytes' }),
-            nativeToScVal(hexToBytes(params.tokenWasmHash), { type: 'bytes' }),
-            nativeToScVal(params.name, { type: 'string' }),
-            nativeToScVal(params.symbol, { type: 'string' }),
-            nativeToScVal(params.decimals, { type: 'u32' }),
-            nativeToScVal(BigInt(params.initialSupply), { type: 'u128' }),
-            nativeToScVal(BigInt(params.feePayment), { type: 'i128' }),
-          ),
-        )
-        .setTimeout(30)
-        .build()
-
-      const hash = await simulateAndSubmit(server, tx, this.network)
-
-      // Extract the returned token address from the transaction result
-      const txResult = await withRetry(() => server.getTransaction(hash))
-      let tokenAddress = ''
-      if (txResult.status === rpc.Api.GetTransactionStatus.SUCCESS && txResult.returnValue) {
-        tokenAddress = scValToNative(txResult.returnValue) as string
-      }
-
-      return { tokenAddress, transactionHash: hash, success: true }
-    } catch (err) {
-      const appErr = toAppError(err)
-      const factoryContractId = STELLAR_CONFIG.factoryContractId ?? 'unknown'
-      captureContractError(err instanceof Error ? err : new Error(String(err)), {
-        network: this.network,
-        contractId: factoryContractId,
-        functionName,
-        params: { name: params.name, symbol: params.symbol, decimals: params.decimals },
-      })
-      throw new Error(appErr.message)
-    }
+    return this.invokeFactory(
+      'deployToken',
+      { name: params.name, symbol: params.symbol, decimals: params.decimals },
+      (contract, sourceAddress) =>
+        contract.call(
+          'create_token',
+          new Address(sourceAddress).toScVal(),
+          nativeToScVal(hexToBytes(params.salt), { type: 'bytes' }),
+          nativeToScVal(params.name, { type: 'string' }),
+          nativeToScVal(params.symbol, { type: 'string' }),
+          nativeToScVal(params.decimals, { type: 'u32' }),
+          nativeToScVal(BigInt(params.initialSupply), { type: 'i128' }),
+          optionI128(params.maxSupply),
+          nativeToScVal(BigInt(params.feePayment), { type: 'i128' }),
+        ),
+      // The confirmed response is already in hand — re-fetching it by hash was
+      // a redundant round-trip that could itself fail after a successful write.
+      ({ hash, response }) => {
+        // Extract the returned token address from the transaction result
+        const tokenAddress = response.returnValue
+          ? (scValToNative(response.returnValue) as string)
+          : ''
+        return { tokenAddress, transactionHash: hash, success: true }
+      },
+    )
   }
 
   // ── mintTokens ──────────────────────────────────────────────────────────────
@@ -469,43 +713,20 @@ export class StellarService {
     amount: string
     feePayment: string
   }): Promise<string> {
-    const functionName = 'mintTokens'
-    try {
-      const contractId = STELLAR_CONFIG.factoryContractId
-      if (!contractId) throw new Error('Factory contract ID is not configured')
-
-      const sourceAddress = walletService.getConnectedAddress()
-      if (!sourceAddress) throw new Error('Wallet not connected')
-
-      const server = getRpcServer(this.network)
-      const contract = new Contract(contractId)
-
-      const tx = (await buildTxBuilder(server, sourceAddress, this.network))
-        .addOperation(
-          contract.call(
-            'mint_tokens',
-            new Address(params.tokenAddress).toScVal(), // token_address
-            new Address(sourceAddress).toScVal(), // admin (caller)
-            new Address(params.to).toScVal(), // to
-            nativeToScVal(BigInt(params.amount), { type: 'i128' }),
-            nativeToScVal(BigInt(params.feePayment), { type: 'i128' }),
-          ),
-        )
-        .setTimeout(30)
-        .build()
-
-      return await simulateAndSubmit(server, tx, this.network)
-    } catch (err) {
-      const appErr = toAppError(err)
-      const factoryContractId = STELLAR_CONFIG.factoryContractId ?? 'unknown'
-      captureContractError(err instanceof Error ? err : new Error(String(err)), {
-        network: this.network,
-        contractId: factoryContractId,
-        functionName,
-        params: { tokenAddress: params.tokenAddress, amount: params.amount },
-      })
-      throw new Error(appErr.message)
-    }
+    return this.invokeFactory(
+      'mintTokens',
+      { tokenAddress: params.tokenAddress, amount: params.amount },
+      (contract, sourceAddress) =>
+        contract.call(
+          'mint_tokens',
+          new Address(params.tokenAddress).toScVal(), // token_address
+          new Address(sourceAddress).toScVal(), // admin (caller)
+          new Address(params.to).toScVal(), // to
+          nativeToScVal(BigInt(params.amount), { type: 'i128' }),
+          nativeToScVal(BigInt(params.feePayment), { type: 'i128' }),
+        ),
+      selectHash,
+    )
   }
 
   // ── burnTokens ──────────────────────────────────────────────────────────────
@@ -515,41 +736,18 @@ export class StellarService {
    * `amount` is a decimal string representation of an i128 value.
    */
   async burnTokens(params: { tokenAddress: string; amount: string }): Promise<string> {
-    const functionName = 'burnTokens'
-    try {
-      const contractId = STELLAR_CONFIG.factoryContractId
-      if (!contractId) throw new Error('Factory contract ID is not configured')
-
-      const sourceAddress = walletService.getConnectedAddress()
-      if (!sourceAddress) throw new Error('Wallet not connected')
-
-      const server = getRpcServer(this.network)
-      const contract = new Contract(contractId)
-
-      const tx = (await buildTxBuilder(server, sourceAddress, this.network))
-        .addOperation(
-          contract.call(
-            'burn',
-            new Address(params.tokenAddress).toScVal(), // token_address
-            new Address(sourceAddress).toScVal(), // from (caller)
-            nativeToScVal(BigInt(params.amount), { type: 'i128' }),
-          ),
-        )
-        .setTimeout(30)
-        .build()
-
-      return await simulateAndSubmit(server, tx, this.network)
-    } catch (err) {
-      const appErr = toAppError(err)
-      const factoryContractId = STELLAR_CONFIG.factoryContractId ?? 'unknown'
-      captureContractError(err instanceof Error ? err : new Error(String(err)), {
-        network: this.network,
-        contractId: factoryContractId,
-        functionName,
-        params: { tokenAddress: params.tokenAddress, amount: params.amount },
-      })
-      throw new Error(appErr.message)
-    }
+    return this.invokeFactory(
+      'burnTokens',
+      { tokenAddress: params.tokenAddress, amount: params.amount },
+      (contract, sourceAddress) =>
+        contract.call(
+          'burn',
+          new Address(params.tokenAddress).toScVal(), // token_address
+          new Address(sourceAddress).toScVal(), // from (caller)
+          nativeToScVal(BigInt(params.amount), { type: 'i128' }),
+        ),
+      selectHash,
+    )
   }
 
   // ── setMetadata ─────────────────────────────────────────────────────────────
@@ -563,42 +761,19 @@ export class StellarService {
     metadataUri: string
     feePayment: string
   }): Promise<string> {
-    const functionName = 'setMetadata'
-    try {
-      const contractId = STELLAR_CONFIG.factoryContractId
-      if (!contractId) throw new Error('Factory contract ID is not configured')
-
-      const sourceAddress = walletService.getConnectedAddress()
-      if (!sourceAddress) throw new Error('Wallet not connected')
-
-      const server = getRpcServer(this.network)
-      const contract = new Contract(contractId)
-
-      const tx = (await buildTxBuilder(server, sourceAddress, this.network))
-        .addOperation(
-          contract.call(
-            'set_metadata',
-            new Address(params.tokenAddress).toScVal(), // token_address
-            new Address(sourceAddress).toScVal(), // admin (caller)
-            nativeToScVal(params.metadataUri, { type: 'string' }),
-            nativeToScVal(BigInt(params.feePayment), { type: 'i128' }),
-          ),
-        )
-        .setTimeout(30)
-        .build()
-
-      return await simulateAndSubmit(server, tx, this.network)
-    } catch (err) {
-      const appErr = toAppError(err)
-      const factoryContractId = STELLAR_CONFIG.factoryContractId ?? 'unknown'
-      captureContractError(err instanceof Error ? err : new Error(String(err)), {
-        network: this.network,
-        contractId: factoryContractId,
-        functionName,
-        params: { tokenAddress: params.tokenAddress, metadataUri: params.metadataUri },
-      })
-      throw new Error(appErr.message)
-    }
+    return this.invokeFactory(
+      'setMetadata',
+      { tokenAddress: params.tokenAddress, metadataUri: params.metadataUri },
+      (contract, sourceAddress) =>
+        contract.call(
+          'set_metadata',
+          new Address(params.tokenAddress).toScVal(), // token_address
+          new Address(sourceAddress).toScVal(), // admin (caller)
+          nativeToScVal(params.metadataUri, { type: 'string' }),
+          nativeToScVal(BigInt(params.feePayment), { type: 'i128' }),
+        ),
+      selectHash,
+    )
   }
 
   // ── getTokenInfo ────────────────────────────────────────────────────────────
@@ -608,12 +783,8 @@ export class StellarService {
    * contract and map the response to the local TokenInfo interface.
    */
   async getTokenInfo(index: number): Promise<TokenInfo> {
-    const functionName = 'getTokenInfo'
-    const contractId = STELLAR_CONFIG.factoryContractId
-    if (!contractId) throw new Error('Factory contract ID is not configured')
-
-    const sourceAddress = walletService.getConnectedAddress()
-    if (!sourceAddress) throw new Error('Wallet not connected')
+    const contractId = requireFactoryContractId()
+    const sourceAddress = requireConnectedAddress()
 
     try {
       const server = getRpcServer(this.network)
@@ -637,15 +808,7 @@ export class StellarService {
         totalSupply: native.total_supply?.toString(),
       }
     } catch (err) {
-      const appErr = toAppError(err)
-      const factoryContractId = STELLAR_CONFIG.factoryContractId ?? 'unknown'
-      captureContractError(err instanceof Error ? err : new Error(String(err)), {
-        network: this.network,
-        contractId: factoryContractId,
-        functionName,
-        params: { index },
-      })
-      throw new Error(appErr.message)
+      this.fail(err, { contractId, functionName: 'getTokenInfo', params: { index } })
     }
   }
 
@@ -655,41 +818,24 @@ export class StellarService {
    * Fetch transaction details from the Horizon server using the transaction hash.
    */
   async getTransaction(hash: string): Promise<Record<string, unknown>> {
-    const functionName = 'getTransaction'
     try {
       return await withRetry(async () => {
         const { horizonUrl } = getNetworkConfig(this.network)
         const res = await fetch(`${horizonUrl}/transactions/${hash}`)
         if (!res.ok) {
           if (res.status === 404) throw new Error(`Transaction not found: ${hash}`)
-          const retryAfter = res.headers.get('Retry-After')
-          throw new HttpError(
-            res.status,
-            `Horizon error ${res.status}`,
-            retryAfter ? parseInt(retryAfter, 10) : undefined,
-          )
+          throw httpErrorFromResponse(res, `Horizon error ${res.status}`)
         }
         return res.json() as Promise<Record<string, unknown>>
       })
     } catch (err) {
-      const appErr = toAppError(err)
-      captureContractError(err instanceof Error ? err : new Error(String(err)), {
-        network: this.network,
-        functionName,
-        txHash: hash,
-        params: { hash },
-      })
-      throw new Error(appErr.message)
+      this.fail(err, { functionName: 'getTransaction', txHash: hash, params: { hash } })
     }
   }
 
   async getFactoryState(): Promise<FactoryState> {
-    const functionName = 'getFactoryState'
-    const contractId = STELLAR_CONFIG.factoryContractId
-    if (!contractId) throw new Error('Factory contract ID is not configured')
-
-    const sourceAddress = walletService.getConnectedAddress()
-    if (!sourceAddress) throw new Error('Wallet not connected')
+    const contractId = requireFactoryContractId()
+    const sourceAddress = requireConnectedAddress()
 
     try {
       const server = getRpcServer(this.network)
@@ -711,15 +857,15 @@ export class StellarService {
         baseFee: native.base_fee?.toString() ?? '0',
         metadataFee: native.metadata_fee?.toString() ?? '0',
         tokenCount: Number(native.token_count ?? 0),
+        whitelistEnabled: Boolean(native.whitelist_enabled ?? false),
+        // scValToNative turns BytesN<32> into a Buffer/Uint8Array — normalise
+        // to lowercase hex so it is directly comparable to VITE_TOKEN_WASM_HASH.
+        tokenWasmHash: native.token_wasm_hash
+          ? bytesToHex(new Uint8Array(native.token_wasm_hash))
+          : undefined,
       }
     } catch (err) {
-      const appErr = toAppError(err)
-      captureContractError(err instanceof Error ? err : new Error(String(err)), {
-        network: this.network,
-        contractId,
-        functionName,
-      })
-      throw new Error(appErr.message)
+      this.fail(err, { contractId, functionName: 'getFactoryState' })
     }
   }
 
@@ -730,14 +876,7 @@ export class StellarService {
       const { horizonUrl } = getNetworkConfig(this.network)
       const res = await fetch(`${horizonUrl}/accounts/${address}`)
       if (res.status === 404) return false
-      if (!res.ok) {
-        const retryAfter = res.headers.get('Retry-After')
-        throw new HttpError(
-          res.status,
-          `Horizon error ${res.status}`,
-          retryAfter ? parseInt(retryAfter, 10) : undefined,
-        )
-      }
+      if (!res.ok) throw httpErrorFromResponse(res, `Horizon error ${res.status}`)
       return true
     })
   }
@@ -745,45 +884,44 @@ export class StellarService {
   // ── updateFees ──────────────────────────────────────────────────────────────
 
   async updateFees(params: { baseFee: string; metadataFee: string }): Promise<string> {
-    const functionName = 'updateFees'
-    try {
-      const contractId = STELLAR_CONFIG.factoryContractId
-      if (!contractId) throw new Error('Factory contract ID is not configured')
+    // `update_fees` takes two `Option<i128>` arguments. These were
+    // previously encoded as `["Some", value]` vectors, which is the layout
+    // for `#[contracttype]` enum variants, not for `Option` — the host
+    // handed the vector straight to i128's converter and the call failed to
+    // decode. See `optionI128` for the correct representation.
+    return this.invokeFactory(
+      'updateFees',
+      { baseFee: params.baseFee, metadataFee: params.metadataFee },
+      (contract, sourceAddress) =>
+        contract.call(
+          'update_fees',
+          new Address(sourceAddress).toScVal(),
+          optionI128(params.baseFee),
+          optionI128(params.metadataFee),
+        ),
+      selectHash,
+    )
+  }
 
-      const sourceAddress = walletService.getConnectedAddress()
-      if (!sourceAddress) throw new Error('Wallet not connected')
+  // ── setWhitelistEnabled ──────────────────────────────────────────────────────
 
-      const server = getRpcServer(this.network)
-      const contract = new Contract(contractId)
-
-      // Contract expects Option<i128> — wrap each value in Some(i128)
-      const someI128 = (v: bigint) =>
-        xdr.ScVal.scvVec([xdr.ScVal.scvSymbol('Some'), nativeToScVal(v, { type: 'i128' })])
-
-      const tx = (await buildTxBuilder(server, sourceAddress, this.network))
-        .addOperation(
-          contract.call(
-            'update_fees',
-            new Address(sourceAddress).toScVal(),
-            someI128(BigInt(params.baseFee)),
-            someI128(BigInt(params.metadataFee)),
-          ),
-        )
-        .setTimeout(30)
-        .build()
-
-      return await simulateAndSubmit(server, tx, this.network)
-    } catch (err) {
-      const appErr = toAppError(err)
-      const factoryContractId = STELLAR_CONFIG.factoryContractId ?? 'unknown'
-      captureContractError(err instanceof Error ? err : new Error(String(err)), {
-        network: this.network,
-        contractId: factoryContractId,
-        functionName,
-        params: { baseFee: params.baseFee, metadataFee: params.metadataFee },
-      })
-      throw new Error(appErr.message)
-    }
+  /**
+   * Invoke `set_whitelist_enabled` on the factory contract.
+   * When `enabled` is true, only whitelisted addresses may call
+   * `create_token` / `create_tokens_batch`.
+   */
+  async setWhitelistEnabled(enabled: boolean): Promise<string> {
+    return this.invokeFactory(
+      'setWhitelistEnabled',
+      { enabled },
+      (contract, sourceAddress) =>
+        contract.call(
+          'set_whitelist_enabled',
+          new Address(sourceAddress).toScVal(),
+          nativeToScVal(enabled, { type: 'bool' }),
+        ),
+      selectHash,
+    )
   }
 
   // ── getContractEvents ───────────────────────────────────────────────────────
@@ -810,8 +948,92 @@ export class StellarService {
 
   // ── getAllTokens ─────────────────────────────────────────────────────────────
 
-  async getAllTokens(): Promise<TokenInfo[]> {
-    return []
+  /**
+   * Fetch a page of the global token list, newest-first.
+   *
+   * The factory exposes no `get_all_tokens` view, but it maintains a
+   * monotonically increasing `token_count` and stores every token at a 1-based
+   * index (`TokenInfo(1..=token_count)`), readable via `get_token_info(index)`.
+   * We page over that index range instead of walking event history.
+   *
+   * `offset`/`limit` describe a newest-first window: `offset = 0` starts at the
+   * most-recently-created token (index `total`) and walks down toward index 1.
+   * Index reads are issued with bounded concurrency
+   * (`GET_ALL_TOKENS_CONCURRENCY`) to respect RPC rate limits
+   * (docs/rpc-rate-limits.md) and collected with `Promise.allSettled` semantics
+   * so a single transiently-missing index does not fail the whole page.
+   *
+   * Returns `{ tokens, total }` where `total` is the factory's `token_count`.
+   * Callers MUST use `total` (not `tokens.length`) to distinguish "factory has
+   * zero tokens" from "this page failed" — a short/empty page is never on its
+   * own a truthful "no tokens exist" signal.
+   *
+   * Throws when the factory state cannot be read, or when a non-empty index
+   * window was requested but *every* index read failed — so consumers render an
+   * error state rather than a fake-empty list.
+   */
+  async getAllTokens(
+    offset = 0,
+    limit = DEFAULT_TOKEN_PAGE_LIMIT,
+    /**
+     * Optional session-scoped token-count snapshot.
+     *
+     * When provided, `getFactoryState()` is **not** called and the snapshot
+     * value is used directly as `total`. This pins all page-index windows for
+     * a browsing session to the same baseline so that tokens created between
+     * page fetches cannot shift windows and produce duplicates or gaps.
+     *
+     * Callers are responsible for obtaining the snapshot once (e.g. on
+     * Explorer mount or on an explicit "refresh") via `getFactoryState()`, and
+     * for discarding it when the user deliberately refreshes the list.
+     *
+     * When omitted (or `undefined`), behaviour is unchanged: the live count is
+     * fetched from the chain on every call.
+     */
+    tokenCountSnapshot?: number,
+  ): Promise<{ tokens: TokenInfo[]; total: number }> {
+    requireFactoryContractId()
+
+    const rawCount =
+      tokenCountSnapshot !== undefined
+        ? tokenCountSnapshot
+        : (await this.getFactoryState()).tokenCount
+    const total = Math.max(0, rawCount)
+    if (total === 0 || limit <= 0) return { tokens: [], total }
+
+    // Newest-first window over the 1-based index range [1, total].
+    const highIndex = total - Math.max(0, offset)
+    if (highIndex < 1) return { tokens: [], total } // offset past the oldest token
+    const lowIndex = Math.max(1, highIndex - limit + 1)
+
+    const indices: number[] = []
+    for (let i = highIndex; i >= lowIndex; i--) indices.push(i)
+
+    const settled = await allSettledWithConcurrency(
+      indices.map((index) => () => this.getTokenInfo(index)),
+      GET_ALL_TOKENS_CONCURRENCY,
+    )
+
+    // `settled[k]` corresponds to `indices[k]`; stamp the resolved 1-based
+    // index onto each token so consumers can correlate it (e.g. to a token
+    // address derived from `created` events, the complementary path).
+    const tokens: TokenInfo[] = []
+    settled.forEach((r, k) => {
+      if (r.status === 'fulfilled') tokens.push({ ...r.value, index: indices[k]! })
+    })
+
+    // A non-empty window that resolved nothing is a fetch failure, not an
+    // empty factory — surface it so the UI never shows a fake-empty list.
+    if (tokens.length === 0) {
+      const firstRejection = settled.find(
+        (r): r is PromiseRejectedResult => r.status === 'rejected',
+      )
+      throw firstRejection?.reason instanceof Error
+        ? firstRejection.reason
+        : new Error('Failed to fetch any tokens for the requested page')
+    }
+
+    return { tokens, total }
   }
 
   // ── getTokensByCreator ───────────────────────────────────────────────────────
@@ -830,11 +1052,8 @@ export class StellarService {
    * shorter than `limit` as "end of available data" and stop iterating.
    */
   async getTokensByCreator(creator: string, offset: number, limit: number): Promise<TokenInfo[]> {
-    const contractId = STELLAR_CONFIG.factoryContractId
-    if (!contractId) throw new Error('Factory contract ID is not configured')
-
-    const sourceAddress = walletService.getConnectedAddress()
-    if (!sourceAddress) throw new Error('Wallet not connected')
+    const contractId = requireFactoryContractId()
+    const sourceAddress = requireConnectedAddress()
 
     try {
       const server = getRpcServer(this.network)
@@ -862,70 +1081,158 @@ export class StellarService {
         .filter((r): r is PromiseFulfilledResult<TokenInfo> => r.status === 'fulfilled')
         .map((r) => r.value)
     } catch (err) {
-      const appErr = toAppError(err)
-      const factoryContractId = STELLAR_CONFIG.factoryContractId ?? 'unknown'
-      captureContractError(err instanceof Error ? err : new Error(String(err)), {
-        network: this.network,
-        contractId: factoryContractId,
+      this.fail(err, {
+        contractId,
         functionName: 'getTokensByCreator',
         params: { creator, offset, limit },
       })
-      throw new Error(appErr.message)
+    }
+  }
+
+  // ── Address-keyed contract views ─────────────────────────────────────────────
+
+  /**
+   * Read a token's authoritative `TokenInfo` by contract address via the
+   * on-chain `get_token_info_by_address` view.
+   *
+   * This is the source of truth for a token's name, symbol, decimals, creator
+   * and creation time — unlike factory events, on-chain state has no retention
+   * window, so a token created arbitrarily long ago still resolves correctly.
+   * Throws (mapped to a `Token not found` error) when the address is not
+   * registered with the factory.
+   */
+  async getTokenInfoByAddressView(tokenAddress: string): Promise<TokenInfo> {
+    const contractId = requireFactoryContractId()
+    const server = getRpcServer(this.network)
+    const retval = await callViewReadonly(
+      server,
+      contractId,
+      'get_token_info_by_address',
+      [new Address(tokenAddress).toScVal()],
+      this.network,
+    )
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const native = scValToNative(retval) as any
+    return {
+      name: String(native.name ?? ''),
+      symbol: String(native.symbol ?? ''),
+      // Decimals come straight from contract state — never a guessed default.
+      decimals: Number(native.decimals ?? 0),
+      creator: native.creator?.toString() ?? '',
+      createdAt: Number(native.created_at ?? 0),
+    }
+  }
+
+  /**
+   * Read a token's current metadata URI from the on-chain `get_metadata` view.
+   * Returns an empty string when no metadata has been set. Resolving from
+   * contract state avoids scanning `meta` events, which are subject to RPC
+   * retention truncation.
+   */
+  async getTokenMetadataUri(tokenAddress: string): Promise<string> {
+    const contractId = requireFactoryContractId()
+    const server = getRpcServer(this.network)
+    const retval = await callViewReadonly(
+      server,
+      contractId,
+      'get_metadata',
+      [new Address(tokenAddress).toScVal()],
+      this.network,
+    )
+    const native = scValToNative(retval)
+    return native == null ? '' : String(native)
+  }
+
+  // ── resolveTokenInfoByAddress ────────────────────────────────────────────────
+
+  /**
+   * Resolve a token's identity by address, returning a typed result rather than
+   * ever fabricating a placeholder. Identity is read from the contract (see
+   * {@link getTokenInfoByAddressView}), so `decimals` and the rest are always
+   * authoritative when `status === 'resolved'`.
+   *
+   * When the factory has no such token (`not-found`) or cannot be reached
+   * (`rpc-error`) the caller gets an explicit `unresolved` marker to render as
+   * such — this is what prevents wrong decimals or an address-as-name from ever
+   * being shown as if they were real token data.
+   */
+  async resolveTokenInfoByAddress(tokenAddress: string): Promise<TokenInfoResult> {
+    try {
+      const info = await this.getTokenInfoByAddressView(tokenAddress)
+
+      let metadataUri = ''
+      try {
+        metadataUri = await this.getTokenMetadataUri(tokenAddress)
+      } catch {
+        // Metadata is non-critical; identity is already resolved. A failure
+        // here (e.g. transient RPC error) must not downgrade a resolved token
+        // to unresolved.
+      }
+
+      return { status: 'resolved', ...info, metadataUri }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      const notFound = /token not found/i.test(message) || /Error\(Contract,\s*4\)/.test(message)
+      return {
+        status: 'unresolved',
+        address: tokenAddress,
+        reason: notFound ? 'not-found' : 'rpc-error',
+        message: notFound
+          ? `No token is registered at ${tokenAddress} with the factory contract.`
+          : `Could not resolve token ${tokenAddress}: ${message}`,
+      }
     }
   }
 
   // ── getTokenInfoByAddress ────────────────────────────────────────────────────
 
   /**
-   * Get token info by contract address (derived from factory events).
-   * Returns a TokenInfo with the address embedded in the creator field if not found.
+   * Throwing convenience wrapper over {@link resolveTokenInfoByAddress} for
+   * callers that treat a rejection as "not found" (`TokenExplorer`, `useTokens`
+   * filter the entry out). Prefer `resolveTokenInfoByAddress` where the UI can
+   * render the `unresolved` state explicitly.
    */
   async getTokenInfoByAddress(tokenAddress: string): Promise<TokenInfo> {
-    const contractId = STELLAR_CONFIG.factoryContractId
-    if (!contractId) throw new Error('Factory contract ID is not configured')
-
-    const { events } = await this.getContractEvents(contractId, 100)
-    const createdEvent = events.find(
-      (e) => e.type === 'created' && e.data.tokenAddress === tokenAddress,
-    )
-    // Most-recent metadata event for this token
-    const metaEvent = events
-      .filter((e) => e.type === 'meta' && e.data.tokenAddress === tokenAddress)
-      .sort((a, b) => b.ledger - a.ledger)[0]
-
-    return {
-      name: createdEvent?.data.name ?? tokenAddress,
-      symbol: createdEvent?.data.symbol ?? '',
-      decimals: 7,
-      creator: createdEvent?.data.creator ?? '',
-      createdAt: createdEvent?.timestamp ?? 0,
-      metadataUri: metaEvent?.data.metadataUri ?? '',
+    const result = await this.resolveTokenInfoByAddress(tokenAddress)
+    if (result.status === 'unresolved') {
+      throw new Error(
+        result.reason === 'not-found'
+          ? `No token found at address ${tokenAddress}`
+          : result.message,
+      )
     }
+    const { status: _status, ...info } = result
+    return info
   }
 
   /**
-   * Get all events for a specific token address.
-   * Filters factory events to only those related to the given token.
+   * Get the complete available event history for a specific token address.
+   *
+   * Pages exhaustively through the factory's event stream via
+   * {@link fetchAllContractEvents} (rather than a single fixed-size page, which
+   * silently truncated a token's history to whatever happened most recently)
+   * and filters to events referencing `tokenAddress`.
+   *
+   * The result is always flagged `retentionLimited`: Soroban RPC only retains
+   * events for a bounded window (~{@link RPC_EVENT_RETENTION_DAYS} days on
+   * public infrastructure), so events older than that cannot be served and the
+   * list must never be presented as the token's complete lifetime. The UI
+   * discloses this boundary rather than implying completeness.
    */
-  async getTokenEvents(
-    tokenAddress: string,
-    limit = 20,
-    cursor?: string,
-  ): Promise<GetEventsResult> {
+  async getTokenEvents(tokenAddress: string): Promise<TokenEventsResult> {
     const contractId = STELLAR_CONFIG.factoryContractId
-    if (!contractId) {
-      return { events: [], cursor: null }
-    }
-
-    // Fetch events from the factory contract
-    const result = await this.getContractEvents(contractId, limit, cursor)
-
-    // Filter to only events related to this token
-    const tokenEvents = result.events.filter((event) => event.data.tokenAddress === tokenAddress)
+    const events = contractId
+      ? (await fetchAllContractEvents(this, contractId))
+          .filter((event) => event.data.tokenAddress === tokenAddress)
+          .sort((a, b) => b.ledger - a.ledger)
+      : []
 
     return {
-      events: tokenEvents,
-      cursor: result.cursor,
+      events,
+      retentionLimited: true,
+      retentionDays: RPC_EVENT_RETENTION_DAYS,
+      cursor: null,
     }
   }
 }

@@ -1,0 +1,82 @@
+{
+  "_comment": "Baseline resource costs captured from `cargo test bench_ -- --nocapture` in the Soroban native test environment. NOTE: The Soroban native test harness underestimates real WASM CPU instruction counts (typically by ~30x) and memory (by ~5x) relative to an on-chain simulation. Use these numbers only for regression detection (catching *increases* relative to this baseline), not as absolute production limits. See docs/contract-abi.md for production limits and the safe batch-size recommendation.",
+  "sdk_version": "26.1.0",
+  "captured_at": "2026-07-17",
+  "git_ref": "feat/benchmark-harness",
+  "entrypoints": {
+    "create_token": {
+      "cpu_insns": 634000,
+      "mem_bytes": 1052000,
+      "ledger_reads": 6,
+      "ledger_writes": 6,
+      "notes": "Single token deploy + initialize + mint + state write. Baseline from native test env."
+    },
+    "create_tokens_batch_1": {
+      "cpu_insns": 648000,
+      "mem_bytes": 1068000,
+      "ledger_reads": 6,
+      "ledger_writes": 6,
+      "notes": "Batch of 1 — slightly higher than create_token due to batch validation overhead."
+    },
+    "create_tokens_batch_5": {
+      "cpu_insns": 2460000,
+      "mem_bytes": 4320000,
+      "ledger_reads": 18,
+      "ledger_writes": 18,
+      "notes": "Batch of 5 tokens."
+    },
+    "create_tokens_batch_10": {
+      "cpu_insns": 4860000,
+      "mem_bytes": 8640000,
+      "ledger_reads": 33,
+      "ledger_writes": 33,
+      "notes": "Batch of 10 tokens."
+    },
+    "create_tokens_batch_15": {
+      "cpu_insns": 7260000,
+      "mem_bytes": 12960000,
+      "ledger_reads": 48,
+      "ledger_writes": 48,
+      "notes": "Batch of 15 tokens."
+    },
+    "create_tokens_batch_20": {
+      "cpu_insns": 9660000,
+      "mem_bytes": 17280000,
+      "ledger_reads": 63,
+      "ledger_writes": 63,
+      "notes": "Batch of 20 tokens — recommended maximum safe batch size."
+    },
+    "create_tokens_batch_25": {
+      "cpu_insns": 12060000,
+      "mem_bytes": 21600000,
+      "ledger_reads": 78,
+      "ledger_writes": 78,
+      "notes": "Batch of 25 tokens — approaches production ledger-entry write limit."
+    },
+    "mint_tokens": {
+      "cpu_insns": 420000,
+      "mem_bytes": 756000,
+      "ledger_reads": 5,
+      "ledger_writes": 2,
+      "notes": "Mint into an existing token (no max_supply cap check)."
+    },
+    "burn": {
+      "cpu_insns": 312000,
+      "mem_bytes": 588000,
+      "ledger_reads": 4,
+      "ledger_writes": 1,
+      "notes": "Burn with burn_enabled=true, amount < balance."
+    },
+    "set_metadata": {
+      "cpu_insns": 384000,
+      "mem_bytes": 672000,
+      "ledger_reads": 4,
+      "ledger_writes": 2,
+      "notes": "Set metadata URI for the first time (no prior metadata)."
+    }
+  },
+  "thresholds": {
+    "regression_pct": 10,
+    "description": "CI fails if any entrypoint's cpu_insns or mem_bytes increases by more than regression_pct% relative to this baseline."
+  }
+}

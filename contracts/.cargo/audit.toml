@@ -1,0 +1,34 @@
+# cargo-audit configuration for the StellarForge contracts workspace.
+#
+# `cargo audit` reads this file automatically when run from `contracts/`.
+# It fails the Security Audit workflow on ANY advisory that is not listed in
+# the `ignore` array below.
+#
+# ---------------------------------------------------------------------------
+# Adding a waiver
+# ---------------------------------------------------------------------------
+# A waiver is an explicit, dated decision that an advisory does not affect this
+# project. It is not a way to silence CI. Every entry in `ignore` MUST be
+# preceded by a waiver block in exactly this form:
+#
+#   # WAIVER: RUSTSEC-0000-0000
+#   # Justification: why this advisory does not affect StellarForge
+#   # Link: https://github.com/Favourorg/Stellar-forge/issues/<n>
+#   # Review-by: YYYY-MM-DD
+#
+# `scripts/check-audit-waivers.mjs` enforces that shape in CI, and the weekly
+# waiver-review job fails once a `Review-by` date has passed so waivers cannot
+# silently outlive their justification.
+#
+# See docs/security-triage.md for the full triage process.
+# ---------------------------------------------------------------------------
+
+[advisories]
+# Advisory IDs waived after triage. Keep this list empty whenever possible.
+ignore = [
+]
+
+# Surface unmaintained/unsound crates as warnings. They are code-quality
+# signals rather than exploitable vulnerabilities, so they are reported without
+# failing the job; actual vulnerability advisories still fail it.
+informational_warnings = ["unmaintained", "unsound"]

@@ -42,7 +42,7 @@ export class ErrorBoundary extends Component<Props, State> {
         : this.props.fallback
     }
     return (
-      <div role="alert" style={{ padding: '2rem', textAlign: 'center' }}>
+      <div role="alert" className="p-8 text-center">
         <h2>Something went wrong</h2>
         <p>An unexpected error occurred. Our team has been notified.</p>
         <button onClick={() => window.location.reload()}>Reload page</button>

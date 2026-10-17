@@ -3,6 +3,17 @@ import { ENV } from './env'
 
 export type Network = 'testnet' | 'mainnet' | 'standalone'
 
+const NETWORK_LABELS: Record<Network, string> = {
+  testnet: 'Testnet',
+  mainnet: 'Mainnet',
+  standalone: 'Standalone',
+}
+
+/** Human-readable network name for UI copy ("Testnet", "Mainnet", …). */
+export function networkLabel(network: Network): string {
+  return NETWORK_LABELS[network]
+}
+
 export interface NetworkConfig {
   networkPassphrase: string
   horizonUrl: string

@@ -16,6 +16,7 @@ interface TokenFormProps {
     symbol: string
     decimals: number
     initialSupply: string
+    maxSupply?: string
   }) => Promise<void>
   isLoading?: boolean
 }
@@ -25,6 +26,7 @@ interface FormErrors {
   symbol?: string
   decimals?: string
   initialSupply?: string
+  maxSupply?: string
 }
 
 export const TokenForm: React.FC<TokenFormProps> = ({ onSubmit, isLoading = false }) => {
@@ -39,6 +41,7 @@ export const TokenForm: React.FC<TokenFormProps> = ({ onSubmit, isLoading = fals
     symbol: '',
     decimals: 7,
     initialSupply: '',
+    maxSupply: '',
   })
 
   const [errors, setErrors] = useState<FormErrors>({})
@@ -98,6 +101,7 @@ export const TokenForm: React.FC<TokenFormProps> = ({ onSubmit, isLoading = fals
         symbol: true,
         decimals: true,
         initialSupply: true,
+        maxSupply: true,
       })
       addToast(t('tokenForm.validationFailed'), 'error')
       return
@@ -178,6 +182,24 @@ export const TokenForm: React.FC<TokenFormProps> = ({ onSubmit, isLoading = fals
           />
           {touched.initialSupply && errors.initialSupply && (
             <p className="mt-1 text-sm text-red-600 dark:text-red-400">{errors.initialSupply}</p>
+          )}
+        </div>
+
+        {/* Max Supply (optional cap) */}
+        <div>
+          <Input
+            label={t('tokenForm.maxSupplyLabel')}
+            value={formData.maxSupply}
+            onChange={(e) => handleChange('maxSupply', e.target.value)}
+            onBlur={() => handleBlur('maxSupply')}
+            placeholder={t('tokenForm.maxSupplyPlaceholder')}
+            error={touched.maxSupply ? errors.maxSupply : undefined}
+          />
+          <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
+            {t('tokenForm.maxSupplyHelp')}
+          </p>
+          {touched.maxSupply && errors.maxSupply && (
+            <p className="mt-1 text-sm text-red-600 dark:text-red-400">{errors.maxSupply}</p>
           )}
         </div>
       </div>

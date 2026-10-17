@@ -7,17 +7,54 @@ on:
   workflow_dispatch:
 
 jobs:
+  # This suite runs against a real testnet deployment, so it needs secrets that
+  # a fork or a fresh clone will not have. Without this gate the nightly run
+  # built an app with an empty factory ID, hit the "App Misconfiguration"
+  # screen, and timed out every single test — a permanently red schedule that
+  # says nothing about the code. `secrets` is not available in a job-level
+  # `if:`, so the decision is made in a step and exported as a job output.
+  preflight:
+    name: Check E2E configuration
+    runs-on: ubuntu-latest
+    outputs:
+      configured: ${{ steps.check.outputs.configured }}
+    steps:
+      - id: check
+        env:
+          FACTORY: ${{ secrets.E2E_FACTORY_CONTRACT_ID }}
+          WASM_HASH: ${{ secrets.E2E_TOKEN_WASM_HASH }}
+          WALLET: ${{ secrets.E2E_TESTNET_WALLET_SECRET }}
+        run: |
+          MISSING=""
+          [ -z "$FACTORY" ] && MISSING="$MISSING E2E_FACTORY_CONTRACT_ID"
+          [ -z "$WASM_HASH" ] && MISSING="$MISSING E2E_TOKEN_WASM_HASH"
+          [ -z "$WALLET" ] && MISSING="$MISSING E2E_TESTNET_WALLET_SECRET"
+
+          if [ -n "$MISSING" ]; then
+            echo "::notice::Testnet E2E skipped — missing repository secrets:$MISSING"
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
   e2e:
     name: Playwright E2E (testnet)
     runs-on: ubuntu-latest
+    needs: preflight
+    if: needs.preflight.outputs.configured == 'true'
     defaults:
       run:
         working-directory: frontend
     env:
       VITE_NETWORK: testnet
       VITE_FACTORY_CONTRACT_ID: ${{ secrets.E2E_FACTORY_CONTRACT_ID }}
-      VITE_IPFS_API_KEY: ${{ secrets.E2E_IPFS_API_KEY }}
-      VITE_IPFS_API_SECRET: ${{ secrets.E2E_IPFS_API_SECRET }}
+      # Required by the frontend's env validation — without it the app renders
+      # the misconfiguration screen and every test times out.
+      VITE_TOKEN_WASM_HASH: ${{ secrets.E2E_TOKEN_WASM_HASH }}
+      # Pinata credentials are server-side only (issue #921) — the frontend
+      # build must not receive them.
+      PINATA_API_KEY: ${{ secrets.E2E_IPFS_API_KEY }}
+      PINATA_API_SECRET: ${{ secrets.E2E_IPFS_API_SECRET }}
       E2E_TOKEN_ADDRESS: ${{ secrets.E2E_TOKEN_ADDRESS }}
       E2E_TESTNET_WALLET_SECRET: ${{ secrets.E2E_TESTNET_WALLET_SECRET }}
       # Expose a standardized variable name to tests
@@ -26,7 +63,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 20
           cache: npm

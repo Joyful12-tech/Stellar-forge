@@ -77,7 +77,10 @@
     "walletNotConnected": "Le portefeuille n'est pas connecté",
     "validationFailed": "Veuillez corriger les erreurs du formulaire",
     "submitError": "Échec de l'envoi du formulaire",
-    "deployedSuccessfully": "déployé avec succès !"
+    "deployedSuccessfully": "déployé avec succès !",
+    "maxSupplyLabel": "Offre maximale (facultatif)",
+    "maxSupplyPlaceholder": "Laisser vide pour illimité",
+    "maxSupplyHelp": "Un plafond strict de l'offre totale. Une fois défini, il ne peut plus être modifié et toute émission au-delà est rejetée."
   },
   "mintForm": {
     "tokenAddress": "Adresse du jeton",

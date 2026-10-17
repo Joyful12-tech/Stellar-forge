@@ -19,9 +19,11 @@ export type CSPDirectives = {
    */
   'script-src': CSPDirectiveValue
   /**
-   * 'unsafe-inline' is required because Tailwind CSS injects styles at
-   * runtime via the style attribute and <style> tags. Until the project
-   * migrates to build-time CSS extraction this cannot be removed.
+   * Tailwind CSS v4 with the PostCSS plugin generates all styles at build
+   * time as a static CSS file. No runtime style injection is needed in
+   * production, so 'unsafe-inline' is not required.
+   * The three remaining inline style usages in the codebase have been
+   * migrated to static classes or CSSOM-based dynamic updates.
    */
   'style-src': CSPDirectiveValue
   /** Images: self, inline data URIs (QR codes), and Pinata IPFS gateway. */
@@ -61,14 +63,14 @@ export type CSPDirectives = {
 export const CSP_DIRECTIVES: CSPDirectives = {
   'default-src': ["'self'"],
   'script-src': ["'self'"],
-  'style-src': ["'self'", "'unsafe-inline'"],
+  'style-src': ["'self'"],
   'img-src': ["'self'", 'data:', 'https://gateway.pinata.cloud'],
   'connect-src': [
     "'self'",
     'https://horizon.stellar.org',
     'https://horizon-testnet.stellar.org',
     'https://soroban-testnet.stellar.org',
-    'https://rpc-mainnet.stellar.org',
+    'https://soroban-mainnet.stellar.org',
     'https://gateway.pinata.cloud',
     'https://api.pinata.cloud',
     'https://*.ingest.sentry.io',

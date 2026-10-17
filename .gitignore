@@ -30,3 +30,4 @@ out/
 *.ps1
 quick-pr.sh
 push-to-fork.sh
+contracts/token-factory/test_snapshots/**/prop_*.json

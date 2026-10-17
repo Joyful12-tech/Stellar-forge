@@ -81,6 +81,7 @@ export function useTokenInfo(address: string): UseTokenInfoResult {
 
   // Re-run whenever the address changes
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- load sets loading state synchronously as the fetch starts. See #1002 follow-up
     load(false)
   }, [load])
 

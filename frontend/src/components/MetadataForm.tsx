@@ -1,17 +1,26 @@
 import React, { useState, useRef } from 'react'
-import { Button, ConfirmModal, InsufficientBalanceWarning, ProgressIndicator } from './UI'
+import {
+  Button,
+  ConfirmModal,
+  InsufficientBalanceWarning,
+  ProgressIndicator,
+  ProgressBar,
+} from './UI'
 import type { ProgressStep } from './UI'
 import { Input } from './UI/Input'
 import { isValidImageFile } from '../utils/validation'
+import { MAX_METADATA_DESCRIPTION_LENGTH, type UploadMetadataResult } from '../services/ipfs'
 import { useToast } from '../context/ToastContext'
 import { useStellarContext } from '../context/StellarContext'
+import { useWalletContext } from '../context/WalletContext'
 import { useBalanceCheck } from '../hooks/useBalanceCheck'
 import { useNetwork } from '../context/NetworkContext'
 import { useNetworkGuard } from '../hooks/useNetworkGuard'
 import { useTos } from '../context/TosContext'
-import { isIpfsConfigured } from '../config/env'
+import { useIpfsReady } from '../hooks/useIpfsReady'
 import { ExplorerLink } from './ExplorerLink'
 import { useFactoryState } from '../hooks/useFactoryState'
+import { TransactionSubmissionError } from '../services/transactionSubmission'
 
 // metadata_fee from contract is in stroops (i128 string); 1 XLM = 10_000_000 stroops
 const STROOPS_PER_XLM = 10_000_000
@@ -26,6 +35,7 @@ type Step = 'idle' | 'uploading-ipfs' | 'confirming-stellar' | 'done' | 'error'
 export const MetadataForm: React.FC<MetadataFormProps> = ({ initialTokenAddress = '' }) => {
   const { ipfsService, stellarService } = useStellarContext()
   const { addToast } = useToast()
+  const { wallet } = useWalletContext()
   const { network } = useNetwork()
   const { blocked: networkBlocked, reason: networkReason } = useNetworkGuard()
   const { requireTos } = useTos()
@@ -50,7 +60,8 @@ export const MetadataForm: React.FC<MetadataFormProps> = ({ initialTokenAddress 
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
-  const ipfsReady = isIpfsConfigured()
+  const ipfsReadiness = useIpfsReady()
+  const ipfsReady = ipfsReadiness === 'ready'
   const isSubmitting = step === 'uploading-ipfs' || step === 'confirming-stellar'
 
   const progressSteps: ProgressStep[] = [
@@ -78,11 +89,11 @@ export const MetadataForm: React.FC<MetadataFormProps> = ({ initialTokenAddress 
     },
   ]
 
-  const handleImageChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleImageChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     if (!file) return
 
-    const validation = isValidImageFile(file)
+    const validation = await isValidImageFile(file)
     if (!validation.valid) {
       addToast(validation.error ?? 'Invalid image file', 'error')
       if (fileInputRef.current) fileInputRef.current.value = ''
@@ -111,6 +122,13 @@ export const MetadataForm: React.FC<MetadataFormProps> = ({ initialTokenAddress 
       addToast('Please enter a token address', 'error')
       return
     }
+    if (description.length > MAX_METADATA_DESCRIPTION_LENGTH) {
+      addToast(
+        `Description must be ${MAX_METADATA_DESCRIPTION_LENGTH} characters or fewer`,
+        'error',
+      )
+      return
+    }
     requireTos(() => setPendingConfirm(true))
   }
 
@@ -122,21 +140,25 @@ export const MetadataForm: React.FC<MetadataFormProps> = ({ initialTokenAddress 
 
     // Step 1: IPFS
     setStep('uploading-ipfs')
-    let metadataUri: string
+    let uploadResult: UploadMetadataResult | null = null
     try {
-      metadataUri = await ipfsService.uploadMetadata(
+      uploadResult = await ipfsService.uploadMetadataDetailed(
         imageFile!,
         description,
         tokenAddress,
+        wallet.address!,
         (p) => setUploadProgress(p),
         (attempt) => addToast(`Retrying upload… (attempt ${attempt}/3)`, 'warning'),
       )
-      setFinalUri(metadataUri)
+      setFinalUri(uploadResult.metadataUri)
     } catch (err) {
       setStep('error')
       const msg = err instanceof Error ? err.message : 'IPFS upload failed'
       setErrorMsg(msg)
       addToast(msg, 'error')
+      // If the image was pinned but the metadata JSON upload failed, reclaim
+      // the image pin rather than leaving it permanently billed.
+      void ipfsService.unpinLastUpload(wallet.address!).catch(() => {})
       return
     }
 
@@ -145,7 +167,7 @@ export const MetadataForm: React.FC<MetadataFormProps> = ({ initialTokenAddress 
     try {
       const hash = await stellarService.setMetadata({
         tokenAddress: tokenAddress.trim(),
-        metadataUri,
+        metadataUri: uploadResult.metadataUri,
         feePayment: metadataFeeStroops,
       })
       setTxHash(hash)
@@ -155,8 +177,19 @@ export const MetadataForm: React.FC<MetadataFormProps> = ({ initialTokenAddress 
       setStep('error')
       const msg = err instanceof Error ? err.message : 'Stellar transaction failed'
       setErrorMsg(msg)
-      // Metadata is pinned but not linked — surface this clearly
-      addToast(`Metadata pinned at ${metadataUri} but on-chain linking failed: ${msg}`, 'error')
+      // Only unpin when we can prove the transaction was NOT applied on-chain
+      // (user rejected signature, dropped, expired, or the contract rejected
+      // it).  'unconfirmed' means the network acknowledged the envelope but we
+      // lost visibility — the pins may already be valid, so leave them for the
+      // reconciliation job (24h grace window) instead of unpinning blindly.
+      const submissionError = err instanceof TransactionSubmissionError ? err : null
+      if (!submissionError || submissionError.safeToRetry) {
+        void ipfsService.unpinLastUpload(wallet.address!).catch(() => {})
+      }
+      addToast(
+        `Metadata pinned at ${uploadResult.metadataUri} but on-chain linking failed: ${msg}`,
+        'error',
+      )
     }
   }
 
@@ -173,18 +206,30 @@ export const MetadataForm: React.FC<MetadataFormProps> = ({ initialTokenAddress 
     if (fileInputRef.current) fileInputRef.current.value = ''
   }
 
+  if (ipfsReadiness === 'checking') {
+    return (
+      <div
+        className="rounded-lg border border-gray-200 dark:border-gray-700 p-4 text-sm text-gray-500 dark:text-gray-400"
+        aria-busy="true"
+        role="status"
+      >
+        Checking upload availability…
+      </div>
+    )
+  }
+
   if (!ipfsReady) {
     return (
       <div className="rounded-lg bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-300 dark:border-yellow-700 p-4 text-sm text-yellow-800 dark:text-yellow-300">
-        IPFS upload is disabled. Set{' '}
+        IPFS upload is disabled: this deployment has no pinning credentials. Set{' '}
         <code className="font-mono bg-yellow-100 dark:bg-yellow-900 px-1 rounded">
-          VITE_IPFS_API_KEY
+          PINATA_API_KEY
         </code>{' '}
         and{' '}
         <code className="font-mono bg-yellow-100 dark:bg-yellow-900 px-1 rounded">
-          VITE_IPFS_API_SECRET
+          PINATA_API_SECRET
         </code>{' '}
-        to enable metadata uploads.
+        in the server environment to enable metadata uploads.
       </div>
     )
   }
@@ -230,9 +275,9 @@ export const MetadataForm: React.FC<MetadataFormProps> = ({ initialTokenAddress 
               <span>{uploadProgress}%</span>
             </div>
             <div className="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-1.5">
-              <div
+              <ProgressBar
+                progress={uploadProgress}
                 className="bg-blue-600 h-1.5 rounded-full transition-all duration-300"
-                style={{ width: `${uploadProgress}%` }}
               />
             </div>
           </div>
@@ -331,6 +376,7 @@ export const MetadataForm: React.FC<MetadataFormProps> = ({ initialTokenAddress 
             onChange={(e) => setDescription(e.target.value)}
             placeholder="Describe your token…"
             rows={3}
+            maxLength={MAX_METADATA_DESCRIPTION_LENGTH}
             className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md
               focus:outline-none focus:ring-2 focus:ring-blue-500
               dark:bg-gray-700 dark:text-white text-sm resize-none"

@@ -101,6 +101,7 @@ export function useTokenBalance(
   }, [tokenAddress, accountAddress])
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- load sets loading state synchronously as the balance fetch starts. See #1002 follow-up
     load()
   }, [load])
 

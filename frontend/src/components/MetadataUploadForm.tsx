@@ -1,9 +1,10 @@
 import React, { useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Input, Button } from './UI'
+import { Input, Button, ProgressBar } from './UI'
 import { useToast } from '../context/ToastContext'
-import { ipfsService } from '../services/ipfs'
-import { isIpfsConfigured } from '../config/env'
+import { useWalletContext } from '../context/WalletContext'
+import { ipfsService, MAX_METADATA_DESCRIPTION_LENGTH } from '../services/ipfs'
+import { useIpfsReady } from '../hooks/useIpfsReady'
 import { isValidImageFile } from '../utils/validation'
 import { DropZone } from './DropZone'
 import { logger } from '../utils/logger'
@@ -19,6 +20,7 @@ export const MetadataUploadForm: React.FC<MetadataUploadFormProps> = ({
 }) => {
   const { t } = useTranslation()
   const { addToast } = useToast()
+  const { wallet } = useWalletContext()
 
   const [tokenName, setTokenName] = useState('')
   const [description, setDescription] = useState('')
@@ -26,12 +28,13 @@ export const MetadataUploadForm: React.FC<MetadataUploadFormProps> = ({
   const [uploadProgress, setUploadProgress] = useState(0)
   const [isUploading, setIsUploading] = useState(false)
 
-  const ipfsReady = isIpfsConfigured()
+  const ipfsReadiness = useIpfsReady()
+  const ipfsReady = ipfsReadiness === 'ready' && wallet.isConnected
 
   const [imagePreview, setImagePreview] = useState<string | null>(null)
 
-  const handleImageSelect = (file: File) => {
-    const validation = isValidImageFile(file)
+  const handleImageSelect = async (file: File) => {
+    const validation = await isValidImageFile(file)
     if (!validation.valid) {
       addToast(validation.error || 'Invalid image file', 'error')
       setImageFile(null)
@@ -75,12 +78,21 @@ export const MetadataUploadForm: React.FC<MetadataUploadFormProps> = ({
       return
     }
 
+    if (description.length > MAX_METADATA_DESCRIPTION_LENGTH) {
+      addToast(
+        `Description must be ${MAX_METADATA_DESCRIPTION_LENGTH} characters or fewer`,
+        'error',
+      )
+      return
+    }
+
     setIsUploading(true)
     try {
       const metadataUri = await ipfsService.uploadMetadata(
         imageFile,
         description,
         tokenName,
+        wallet.address!,
         (progress) => setUploadProgress(progress),
         (attempt) => addToast(`Retrying upload… (attempt ${attempt}/3)`, 'warning'),
       )
@@ -101,19 +113,44 @@ export const MetadataUploadForm: React.FC<MetadataUploadFormProps> = ({
     }
   }
 
-  if (!ipfsReady) {
+  // The three reasons uploads may be unavailable are distinct and used to be
+  // collapsed into one "set your API keys" message — which was wrong advice
+  // for two of them.
+  if (ipfsReadiness === 'checking') {
+    return (
+      <div
+        className="rounded-lg border border-gray-200 dark:border-gray-700 p-4"
+        aria-busy="true"
+        role="status"
+      >
+        <p className="text-sm text-gray-500 dark:text-gray-400">Checking upload availability…</p>
+      </div>
+    )
+  }
+
+  if (ipfsReadiness === 'unconfigured') {
     return (
       <div className="rounded-lg bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-300 dark:border-yellow-700 p-4">
         <p className="text-sm text-yellow-800 dark:text-yellow-300">
-          IPFS upload is disabled. Set{' '}
+          IPFS upload is disabled: this deployment has no pinning credentials. Set{' '}
           <code className="font-mono bg-yellow-100 dark:bg-yellow-900 px-1 rounded">
-            VITE_IPFS_API_KEY
+            PINATA_API_KEY
           </code>{' '}
           and{' '}
           <code className="font-mono bg-yellow-100 dark:bg-yellow-900 px-1 rounded">
-            VITE_IPFS_API_SECRET
+            PINATA_API_SECRET
           </code>{' '}
-          to enable metadata uploads.
+          in the server environment to enable metadata uploads.
+        </p>
+      </div>
+    )
+  }
+
+  if (!wallet.isConnected) {
+    return (
+      <div className="rounded-lg bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-300 dark:border-yellow-700 p-4">
+        <p className="text-sm text-yellow-800 dark:text-yellow-300">
+          Connect your wallet to upload token metadata.
         </p>
       </div>
     )
@@ -145,6 +182,7 @@ export const MetadataUploadForm: React.FC<MetadataUploadFormProps> = ({
           placeholder={t('tokenForm.descriptionPlaceholder')}
           className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 dark:bg-gray-700 dark:text-white text-sm"
           rows={3}
+          maxLength={MAX_METADATA_DESCRIPTION_LENGTH}
         />
       </div>
 
@@ -191,10 +229,7 @@ export const MetadataUploadForm: React.FC<MetadataUploadFormProps> = ({
             <span className="font-medium text-gray-900 dark:text-white">{uploadProgress}%</span>
           </div>
           <div className="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-2">
-            <div
-              className="bg-blue-600 h-2 rounded-full transition-all duration-300"
-              style={{ width: `${uploadProgress}%` }}
-            />
+            <ProgressBar progress={uploadProgress} />
           </div>
         </div>
       )}

@@ -12,6 +12,8 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
+soroban-sdk = { version = "27.0.0", features = ["testutils"] }
+token-factory = { package = "token-factory-testutils-lib", path = "../testutils-lib", features = ["testutils"] }
 
 [[bin]]
 name = "fuzz_create_token"

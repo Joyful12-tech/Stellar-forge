@@ -3,3 +3,19 @@ members = [
     "token-factory",
 ]
 resolver = "2"
+
+# Standard Soroban size-optimized release profile. Without these overrides
+# the default release profile (opt-level = 3, no LTO, unstripped, unwinding
+# panics) produces a WASM binary large enough to threaten the 64 KiB
+# Soroban contract-data size limit checked in CI (see
+# scripts/check-wasm-size.mjs) well before the contract's logic itself grows
+# meaningfully.
+[profile.release]
+opt-level = "z"
+overflow-checks = true
+debug = 0
+strip = "symbols"
+debug-assertions = false
+panic = "abort"
+codegen-units = 1
+lto = true

@@ -1,9 +1,8 @@
 // IPFS configuration
-import { ENV } from './env'
-
+//
+// Public endpoints only. Credentials are server-side (see api/_lib/pinata.ts);
+// anything secret placed here would be inlined into the browser bundle.
 export const IPFS_CONFIG = {
-  apiKey: ENV.ipfsApiKey,
-  apiSecret: ENV.ipfsApiSecret,
   pinataApiUrl: 'https://api.pinata.cloud',
   pinataGateway: 'https://gateway.pinata.cloud/ipfs',
 }

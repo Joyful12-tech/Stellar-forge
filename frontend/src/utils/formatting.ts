@@ -89,10 +89,48 @@ export const xlmToStroops = (xlm: number | string): number => {
   return Math.floor(parseFloat(xlm.toString()) * 10_000_000)
 }
 
-/** Convert an ipfs:// URI to a Pinata gateway URL. */
+/**
+ * Inline placeholder rendered in place of token art we refuse to load.
+ * A self-contained data: URI so displaying it never issues a network request.
+ */
+export const TOKEN_IMAGE_PLACEHOLDER =
+  'data:image/svg+xml,' +
+  encodeURIComponent(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 96 96">' +
+      '<rect width="96" height="96" fill="#e5e7eb"/>' +
+      '<path d="M28 62l14-18 10 12 6-7 10 13z" fill="#9ca3af"/>' +
+      '<circle cx="36" cy="34" r="6" fill="#9ca3af"/>' +
+      '</svg>',
+  )
+
+/**
+ * Convert an ipfs:// URI to a Pinata gateway URL.
+ *
+ * Anything that is not a well-formed `ipfs://` URI resolves to
+ * TOKEN_IMAGE_PLACEHOLDER rather than being returned unchanged. Token metadata
+ * is attacker-controlled — it is pinned by whoever created the token — so
+ * passing an arbitrary URL through here would let a token embed a
+ * `https://evil.example/pixel.png` that every viewer's browser then fetches,
+ * leaking IP and user-agent and giving the creator a view-tracking beacon.
+ * Returning a placeholder keeps rendering total (callers always get a usable
+ * src) while guaranteeing the only origin we ever hit is the IPFS gateway.
+ */
 export const ipfsToGatewayUrl = (uri: string): string => {
-  if (!uri.startsWith('ipfs://')) return uri
+  if (typeof uri !== 'string') return TOKEN_IMAGE_PLACEHOLDER
+  if (!uri.startsWith('ipfs://')) return TOKEN_IMAGE_PLACEHOLDER
+
   const path = uri.slice('ipfs://'.length).replace(/^\/+/, '')
+  // Reject traversal, embedded credentials/hosts, or an empty CID — all of
+  // which could steer the request away from the gateway path we intend.
+  if (!path || !/^[A-Za-z0-9][A-Za-z0-9._-]*(\/[A-Za-z0-9._-]+)*$/.test(path)) {
+    return TOKEN_IMAGE_PLACEHOLDER
+  }
+  // A `..` segment would still normalise out of the /ipfs/ prefix in the
+  // browser, so reject it even though the origin itself stays correct.
+  if (path.split('/').some((segment) => segment === '..' || segment === '.')) {
+    return TOKEN_IMAGE_PLACEHOLDER
+  }
+
   const gatewayBase = IPFS_CONFIG.pinataGateway.replace(/\/+$/, '')
   return `${gatewayBase}/${path}`
 }

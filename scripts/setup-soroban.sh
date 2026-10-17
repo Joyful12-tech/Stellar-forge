@@ -43,8 +43,8 @@ else
 fi
 
 # Add wasm32 target
-echo "Adding wasm32-unknown-unknown target..."
-rustup target add wasm32-unknown-unknown || error_exit "Failed to add wasm32 target"
+echo "Adding wasm32v1-none target..."
+rustup target add wasm32v1-none || error_exit "Failed to add wasm32 target"
 
 # Install Stellar CLI (replaces the old soroban-cli crate)
 if ! command_exists stellar; then

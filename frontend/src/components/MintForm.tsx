@@ -1,29 +1,35 @@
-import React, { useEffect, useCallback, useRef } from 'react'
+import React, { useEffect, useCallback, useState } from 'react'
 import { useForm, Controller } from 'react-hook-form'
 import { Input, Button, ConfirmModal, InsufficientBalanceWarning, Select } from './UI'
-import { useTransaction } from '../hooks/useTransaction'
+import { useTransaction, isTransactionInFlight } from '../hooks/useTransaction'
 import { useTos } from '../context/TosContext'
 import { useStellarContext } from '../context/StellarContext'
 import { useWalletContext } from '../context/WalletContext'
 import { useToast } from '../context/ToastContext'
-import { useNetwork } from '../context/NetworkContext'
 import { useBalanceCheck } from '../hooks/useBalanceCheck'
 import { useTokenDashboard } from '../hooks/useTokenDashboard'
 import { isValidStellarAddress, isValidContractAddress } from '../utils/validation'
-import { stellarExplorerUrl, stroopsToXLM, formatXLM } from '../utils/formatting'
+import { stroopsToXLM, formatXLM } from '../utils/formatting'
+import {
+  MANUAL_TOKEN_VALUE,
+  initialTokenSelection,
+  tokenLabel,
+  tokenSelectOptions,
+} from '../utils/tokenSelect'
+import { useMountedRef } from '../hooks/useMountedRef'
+import { TxSuccessNotice } from './TxSuccessNotice'
 import { useDebounce } from '../hooks/useDebounce'
 import { useFactoryState } from '../hooks/useFactoryState'
 import { useNetworkGuard } from '../hooks/useNetworkGuard'
+import { NetworkGuardAlert } from './NetworkGuardAlert'
 import { FeeDisplay } from './FeeDisplay'
-import { useState } from 'react'
 
 // Fallback fee used only until the on-chain factory state loads.
 const BASE_FEE_STROOPS = '100000'
-const MANUAL_VALUE = '__manual__'
 
 interface MintFormData {
-  tokenSelect: string // dropdown value — either a contract address or MANUAL_VALUE
-  tokenManual: string // shown only when tokenSelect === MANUAL_VALUE
+  tokenSelect: string // dropdown value — either a contract address or MANUAL_TOKEN_VALUE
+  tokenManual: string // shown only when tokenSelect === MANUAL_TOKEN_VALUE
   recipient: string
   amount: string
 }
@@ -39,11 +45,11 @@ export const MintForm: React.FC<MintFormProps> = ({
 }) => {
   const { stellarService } = useStellarContext()
   const { wallet } = useWalletContext()
-  const { network } = useNetwork()
   const { addToast } = useToast()
   const { requireTos } = useTos()
   const { state: factoryState } = useFactoryState()
-  const { blocked: networkBlocked, reason: networkReason } = useNetworkGuard()
+  const networkGuard = useNetworkGuard()
+  const networkBlocked = networkGuard.blocked
   // Pay the real on-chain base_fee; the contract rejects mint if fee_payment < base_fee.
   const feePaymentStroops = factoryState?.baseFee ?? BASE_FEE_STROOPS
   const feeXlm = stroopsToXLM(feePaymentStroops)
@@ -54,14 +60,7 @@ export const MintForm: React.FC<MintFormProps> = ({
   const [recipientHasAccount, setRecipientHasAccount] = useState<boolean | null>(null)
   const [isCheckingRecipient, setIsCheckingRecipient] = useState(false)
   const [txHash, setTxHash] = useState<string | null>(null)
-  const mountedRef = useRef(true)
-
-  useEffect(() => {
-    mountedRef.current = true
-    return () => {
-      mountedRef.current = false
-    }
-  }, [])
+  const mountedRef = useMountedRef()
 
   const {
     register,
@@ -71,7 +70,7 @@ export const MintForm: React.FC<MintFormProps> = ({
     formState: { errors },
   } = useForm<MintFormData>({
     defaultValues: {
-      tokenSelect: initialAddress || (myTokens.length > 0 ? myTokens[0]!.address : MANUAL_VALUE),
+      tokenSelect: initialTokenSelection(initialAddress, myTokens),
       tokenManual: initialAddress,
       recipient: '',
       amount: '',
@@ -88,7 +87,7 @@ export const MintForm: React.FC<MintFormProps> = ({
   const amount = watch('amount')
 
   // Resolved token address: dropdown selection or manual input
-  const resolvedTokenAddress = tokenSelect === MANUAL_VALUE ? tokenManual : tokenSelect
+  const resolvedTokenAddress = tokenSelect === MANUAL_TOKEN_VALUE ? tokenManual : tokenSelect
 
   // Token info from dropdown selection
   const selectedToken = myTokens.find((t) => t.address === tokenSelect)
@@ -119,7 +118,7 @@ export const MintForm: React.FC<MintFormProps> = ({
     return () => {
       cancelled = true
     }
-  }, [debouncedRecipient, stellarService])
+  }, [debouncedRecipient, stellarService, mountedRef])
 
   const mintBuilder = useCallback(
     () =>
@@ -133,11 +132,7 @@ export const MintForm: React.FC<MintFormProps> = ({
   )
 
   const { execute: executeMint, status: txStatus } = useTransaction(mintBuilder)
-  const isSubmitting =
-    txStatus === 'simulating' ||
-    txStatus === 'signing' ||
-    txStatus === 'submitting' ||
-    txStatus === 'polling'
+  const isSubmitting = isTransactionInFlight(txStatus)
 
   const onValid = () => {
     if (!wallet.isConnected) {
@@ -163,11 +158,6 @@ export const MintForm: React.FC<MintFormProps> = ({
     }
   }
 
-  const tokenOptions = [
-    ...myTokens.map((t) => ({ value: t.address, label: `${t.name} (${t.symbol})` })),
-    { value: MANUAL_VALUE, label: 'Manual input…' },
-  ]
-
   return (
     <>
       <form onSubmit={handleSubmit(onValid)} className="space-y-4" noValidate>
@@ -179,11 +169,7 @@ export const MintForm: React.FC<MintFormProps> = ({
           render={({ field }) => (
             <Select
               label="Token"
-              options={
-                tokenOptions.length > 1
-                  ? tokenOptions
-                  : [{ value: MANUAL_VALUE, label: 'Manual input…' }]
-              }
+              options={tokenSelectOptions(myTokens)}
               placeholder={myTokens.length === 0 ? 'No tokens found — use manual input' : undefined}
               error={errors.tokenSelect?.message}
               required
@@ -196,7 +182,7 @@ export const MintForm: React.FC<MintFormProps> = ({
         />
 
         {/* Manual token address input */}
-        {tokenSelect === MANUAL_VALUE && (
+        {tokenSelect === MANUAL_TOKEN_VALUE && (
           <Input
             label="Token Address"
             placeholder="C..."
@@ -280,34 +266,14 @@ export const MintForm: React.FC<MintFormProps> = ({
           {isSubmitting ? 'Processing Transaction…' : 'Mint Tokens'}
         </Button>
 
-        {networkBlocked && networkReason && (
-          <p className="text-sm text-red-600 dark:text-red-400" role="alert">
-            {networkReason}
-          </p>
-        )}
+        <NetworkGuardAlert guard={networkGuard} />
 
         {!hasSufficientBalance && (
           <InsufficientBalanceWarning shortfall={shortfall} isTestnet={isTestnet} />
         )}
       </form>
 
-      {/* Success feedback with explorer link */}
-      {txHash && (
-        <div
-          role="status"
-          className="mt-4 p-3 rounded-lg bg-green-50 dark:bg-green-900/30 border border-green-200 dark:border-green-700 text-sm text-green-800 dark:text-green-300 flex flex-col gap-1"
-        >
-          <span className="font-medium">✓ Tokens minted successfully</span>
-          <a
-            href={stellarExplorerUrl('tx', txHash, network)}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="underline text-green-700 dark:text-green-400 text-xs"
-          >
-            View on Stellar Explorer →
-          </a>
-        </div>
-      )}
+      <TxSuccessNotice txHash={txHash} message="Tokens minted successfully" />
 
       <ConfirmModal
         isOpen={pending}
@@ -316,9 +282,7 @@ export const MintForm: React.FC<MintFormProps> = ({
         details={[
           {
             label: 'Token',
-            value: selectedToken
-              ? `${selectedToken.name} (${selectedToken.symbol})`
-              : resolvedTokenAddress,
+            value: selectedToken ? tokenLabel(selectedToken) : resolvedTokenAddress,
           },
           { label: 'Recipient', value: recipient },
           { label: 'Amount', value: amount },

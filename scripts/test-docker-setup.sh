@@ -49,11 +49,11 @@ fi
 
 # Test contract compilation
 echo "🦀 Testing contract compilation..."
-if docker compose exec -T contract-builder bash -c "cd token-factory && cargo check --target wasm32-unknown-unknown" > /dev/null; then
+if docker compose exec -T contract-builder bash -c "cd token-factory && cargo check --target wasm32v1-none" > /dev/null; then
     echo "✅ Contract compiles successfully"
 else
     echo "❌ Contract compilation failed"
-    docker compose exec contract-builder bash -c "cd token-factory && cargo check --target wasm32-unknown-unknown"
+    docker compose exec contract-builder bash -c "cd token-factory && cargo check --target wasm32v1-none"
     exit 1
 fi
 

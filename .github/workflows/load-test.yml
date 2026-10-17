@@ -27,8 +27,9 @@ jobs:
       VITE_NETWORK: ${{ github.event.inputs.network || 'testnet' }}
       VITE_FACTORY_CONTRACT_ID: ${{ secrets.E2E_FACTORY_CONTRACT_ID }}
       VITE_TOKEN_WASM_HASH: '0000000000000000000000000000000000000000000000000000000000000000'
-      VITE_IPFS_API_KEY: ${{ secrets.E2E_IPFS_API_KEY }}
-      VITE_IPFS_API_SECRET: ${{ secrets.E2E_IPFS_API_SECRET }}
+      # Server-side only (issue #921): never VITE_-prefixed.
+      PINATA_API_KEY: ${{ secrets.E2E_IPFS_API_KEY }}
+      PINATA_API_SECRET: ${{ secrets.E2E_IPFS_API_SECRET }}
       TESTNET_SECRET: ${{ secrets.E2E_TESTNET_WALLET_SECRET }}
       LOAD_TEST_RUN: 'true'
       LOAD_TEST_SESSIONS: ${{ github.event.inputs.concurrent_sessions || '5' }}
@@ -37,7 +38,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 20
           cache: npm
@@ -55,8 +56,6 @@ jobs:
           VITE_NETWORK: ${{ github.event.inputs.network || 'testnet' }}
           VITE_FACTORY_CONTRACT_ID: ${{ secrets.E2E_FACTORY_CONTRACT_ID }}
           VITE_TOKEN_WASM_HASH: '0000000000000000000000000000000000000000000000000000000000000000'
-          VITE_IPFS_API_KEY: ${{ secrets.E2E_IPFS_API_KEY }}
-          VITE_IPFS_API_SECRET: ${{ secrets.E2E_IPFS_API_SECRET }}
 
       - name: Run load test
         run: npx playwright test --grep "load-test" --reporter=html

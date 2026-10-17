@@ -18,15 +18,20 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: 'npm'
 
       - name: Install dependencies
         run: npm ci
+        env:
+          # Skip the husky prepare script — git hooks must not run in CI, and
+          # the commit-msg hook breaks semantic-release's own release commit.
+          HUSKY: 0
 
       - name: Release
         run: npx semantic-release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HUSKY: 0

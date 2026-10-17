@@ -1,0 +1,115 @@
+// DRIFT SCENARIO 1: require_whitelisted removed from create_token but docs still claim it
+// Fixture for: DESTRUCTIVE TEST - missing whitelist gate
+
+pub fn __constructor(env: Env, admin: Address) -> Result<(), Error> {
+    admin.require_auth();
+    Ok(())
+}
+
+pub fn add_to_whitelist(env: Env, admin: Address, account: Address) -> Result<(), Error> {
+    admin.require_auth();
+    let state = get_state(&env);
+    if state.admin != admin {
+        return Err(Error::Unauthorized);
+    }
+    Ok(())
+}
+
+pub fn remove_from_whitelist(env: Env, admin: Address, account: Address) -> Result<(), Error> {
+    admin.require_auth();
+    let state = get_state(&env);
+    if state.admin != admin {
+        return Err(Error::Unauthorized);
+    }
+    Ok(())
+}
+
+pub fn set_whitelist_enabled(env: Env, admin: Address, enabled: bool) -> Result<(), Error> {
+    admin.require_auth();
+    let state = get_state(&env);
+    if state.admin != admin {
+        return Err(Error::Unauthorized);
+    }
+    Ok(())
+}
+
+pub fn is_whitelisted(env: Env, account: Address) -> Result<bool, Error> {
+    let state = get_state(&env);
+    Ok(state.whitelist.contains(&account))
+}
+
+pub fn create_token(
+    env: Env,
+    creator: Address,
+    symbol: String,
+    name: String,
+    initial_supply: i128,
+) -> Result<Address, Error> {
+    creator.require_auth();
+    // REMOVED: Self::require_whitelisted(&env, &state, &creator)?;
+    // ^ DRIFT: This is what breaks the contract!
+    Ok(Address::generate(&env))
+}
+
+pub fn create_tokens_batch(
+    env: Env,
+    creator: Address,
+    tokens: Vec<TokenDefinition>,
+) -> Result<Vec<Address>, Error> {
+    creator.require_auth();
+    let state = get_state(&env);
+    if state.whitelist_enabled {
+        Self::require_whitelisted(&env, &state, &creator)?;
+    }
+    Ok(vec![])
+}
+
+pub fn set_metadata(
+    env: Env,
+    admin: Address,
+    creator: Address,
+    token_address: Address,
+    metadata: Metadata,
+) -> Result<(), Error> {
+    admin.require_auth();
+    let state = get_state(&env);
+    if state.admin != admin {
+        return Err(Error::Unauthorized);
+    }
+    if creator != admin {
+        creator.require_auth();
+    }
+    Ok(())
+}
+
+fn require_whitelisted(env: &Env, state: &State, creator: &Address) -> Result<(), Error> {
+    if !state.whitelist.contains(creator) {
+        return Err(Error::NotWhitelisted);
+    }
+    Ok(())
+}
+
+struct State {
+    admin: Address,
+    whitelist: Vec<Address>,
+    whitelist_enabled: bool,
+}
+
+#[derive(Clone)]
+struct Metadata {
+    key: String,
+    value: String,
+}
+
+#[derive(Clone)]
+struct TokenDefinition {
+    symbol: String,
+    name: String,
+    initial_supply: i128,
+}
+
+#[derive(Debug)]
+pub enum Error {
+    Unauthorized,
+    NotWhitelisted,
+}

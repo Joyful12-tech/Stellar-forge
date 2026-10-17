@@ -1,35 +1,4 @@
 version: 2
-
-# Group minor and patch updates together to reduce PR noise
-groups:
-  minor-patch:
-    update-types:
-      - minor
-      - patch
-    patterns:
-      - "*"
-
-updates:
-  - package-ecosystem: "npm"
-    directory: "/frontend"
-    schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 10
-    assignees:
-      - bigvictoh
-    reviewers:
-      - bigvictoh
-
-  - package-ecosystem: "cargo"
-    directory: "/contracts"
-    schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 10
-    assignees:
-      - bigvictoh
-    reviewers:
-      - bigvictoh
-version: 2
 updates:
   # Frontend npm dependencies
   - package-ecosystem: npm
@@ -63,7 +32,7 @@ updates:
       - dependencies
       - javascript
 
-  # Rust / Cargo dependencies
+  # Rust / Cargo dependencies — main contracts workspace
   - package-ecosystem: cargo
     directory: /contracts
     schedule:
@@ -74,6 +43,22 @@ updates:
     labels:
       - dependencies
       - rust
+
+  # Rust / Cargo dependencies — fuzz workspace (separate lockfile)
+  # contracts/token-factory/fuzz has its own [workspace] and Cargo.lock,
+  # so it must be listed as an independent entry to avoid its transitive
+  # dependencies falling behind the main workspace's audit coverage.
+  - package-ecosystem: cargo
+    directory: /contracts/token-factory/fuzz
+    schedule:
+      interval: weekly
+      day: monday
+      time: '08:00'
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - rust
+      - fuzz
 
   # GitHub Actions
   - package-ecosystem: github-actions

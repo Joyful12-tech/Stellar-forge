@@ -1,0 +1,111 @@
+name: Contract Benchmarks
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "contracts/**"
+  push:
+    branches: [main]
+    paths:
+      - "contracts/**"
+  workflow_dispatch:
+    inputs:
+      blocking:
+        description: "Fail CI on regression (set to '1' to enable)"
+        required: false
+        default: "0"
+      threshold_pct:
+        description: "Regression threshold percentage (default: 10)"
+        required: false
+        default: "10"
+      update_baseline:
+        description: "Update baseline.json with current measurements (true/false)"
+        required: false
+        default: "false"
+
+jobs:
+  benchmark:
+    name: Resource Cost Benchmarks
+    runs-on: ubuntu-latest
+    # Non-blocking informational job. Regressions are surfaced as warnings
+    # in the job summary. Promote to blocking by setting BENCH_BLOCKING=1
+    # (or via workflow_dispatch input) once baselines stabilize.
+    continue-on-error: true
+
+    permissions:
+      contents: write  # needed only when update_baseline is true
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Full history needed if updating baseline (for commit)
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: contracts
+
+      - name: Run benchmark tests
+        run: |
+          cargo test --features bench bench_ -- --nocapture 2>/dev/null | tee /tmp/bench_raw.txt || true
+          echo "Benchmark test run complete. Lines captured: $(wc -l < /tmp/bench_raw.txt)"
+        working-directory: contracts/token-factory
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Compare against baseline
+        id: compare
+        run: |
+          python3 scripts/check_benchmarks.py \
+            --baseline contracts/token-factory/bench_snapshots/baseline.json \
+            < /tmp/bench_raw.txt | tee /tmp/bench_report.txt
+          echo "report_file=/tmp/bench_report.txt" >> "$GITHUB_OUTPUT"
+        env:
+          BENCH_BLOCKING: ${{ github.event.inputs.blocking || '0' }}
+          BENCH_THRESHOLD_PCT: ${{ github.event.inputs.threshold_pct || '10' }}
+
+      - name: Write job summary
+        if: always()
+        run: |
+          echo "## 📊 Contract Resource Benchmark Report" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
+          cat /tmp/bench_report.txt >> "$GITHUB_STEP_SUMMARY"
+          echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "> **Note:** Measurements come from the Soroban native test harness, which underestimates" >> "$GITHUB_STEP_SUMMARY"
+          echo "> real WASM CPU/memory costs (typically ~30× for CPU, ~5× for memory)." >> "$GITHUB_STEP_SUMMARY"
+          echo "> Use for *relative* regression tracking, not as absolute production limits." >> "$GITHUB_STEP_SUMMARY"
+          echo "> See [docs/contract-abi.md](docs/contract-abi.md) for production resource limits." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Update baseline (manual dispatch only)
+        if: >
+          github.event_name == 'workflow_dispatch' &&
+          github.event.inputs.update_baseline == 'true'
+        run: |
+          python3 scripts/check_benchmarks.py \
+            --baseline contracts/token-factory/bench_snapshots/baseline.json \
+            --update-baseline \
+            < /tmp/bench_raw.txt
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add contracts/token-factory/bench_snapshots/baseline.json
+          git commit -m "chore: update benchmark baseline [skip ci]" || echo "No changes to commit"
+          git push
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-results-${{ github.run_id }}
+          path: |
+            /tmp/bench_raw.txt
+            /tmp/bench_report.txt
+          retention-days: 30

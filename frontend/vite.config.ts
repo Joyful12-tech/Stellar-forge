@@ -31,7 +31,8 @@ export default defineConfig({
       manifest: {
         name: 'StellarForge',
         short_name: 'StellarForge',
-        description: 'Deploy and manage custom tokens on the Stellar blockchain without writing code.',
+        description:
+          'Deploy and manage custom tokens on the Stellar blockchain without writing code.',
         theme_color: '#7c3aed',
         background_color: '#0f0f1a',
         display: 'standalone',
@@ -54,6 +55,7 @@ export default defineConfig({
         ],
       },
       workbox: {
+        cacheId: `stellarforge-${process.env.VITE_FACTORY_CONTRACT_ID?.slice(0, 8)}-${process.env.VITE_NETWORK}`,
         globPatterns: ['**/*.{js,css,html,ico,png,svg,woff2}'],
         navigateFallback: '/offline.html',
         navigateFallbackDenylist: [/^\/api/],
@@ -89,15 +91,15 @@ export default defineConfig({
         manualChunks: (id) => {
           if (id.includes('node_modules')) {
             if (id.includes('react') || id.includes('react-dom')) {
-              return 'react';
+              return 'react'
             }
             if (id.includes('stellar') || id.includes('@stellar')) {
-              return 'stellar';
+              return 'stellar'
             }
-            return 'vendor';
+            return 'vendor'
           }
-        }
-      }
-    }
-  }
+        },
+      },
+    },
+  },
 })

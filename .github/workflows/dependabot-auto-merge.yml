@@ -1,0 +1,111 @@
+name: Dependabot Auto-merge
+
+# Auto-merge policy (mirrors what is documented in CONTRIBUTING.md):
+#
+#   patch bumps          → merged automatically once all required CI checks pass.
+#   minor bumps          → merged automatically once all required CI checks pass.
+#   major bumps          → flagged for manual review; auto-merge is NOT enabled.
+#   pre-1.0 (0.x) bumps  → flagged for manual review; auto-merge is NOT enabled,
+#                          regardless of whether the bump is a patch or a minor,
+#                          because semver provides no non-breaking guarantee
+#                          below 1.0.
+#
+# The `0.x` gate is the first line of defense against a compromised upstream
+# package publishing a malicious patch/minor release: routing pre-1.0 bumps to
+# human review leaves a window for the ecosystem to catch obviously-malicious
+# releases. (See CONTRIBUTING.md for the evaluation of additional package-age
+# and provenance/Scorecard gates, which are not yet automated.)
+#
+# The workflow runs on every Dependabot PR (opened or synchronised) and, for
+# eligible update types, enables GitHub's native auto-merge so the PR closes
+# itself as soon as branch-protection requirements are satisfied.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    name: Enable auto-merge for eligible Dependabot PRs
+    runs-on: ubuntu-latest
+
+    # Only run for PRs opened by Dependabot.
+    if: github.actor == 'dependabot[bot]'
+
+    steps:
+      - name: Fetch Dependabot metadata
+        id: dependabot-metadata
+        uses: dependabot/fetch-metadata@v3
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Patch updates (1.0+) ────────────────────────────────────────────
+      # Enable auto-merge unconditionally for patch-level bumps across all
+      # ecosystems (npm, cargo, github-actions), except pre-1.0 packages.
+      - name: Enable auto-merge for patch updates
+        if: >-
+          steps.dependabot-metadata.outputs.update-type == 'version-update:semver-patch'
+          && !startsWith(steps.dependabot-metadata.outputs.new-version, '0.')
+          && !startsWith(steps.dependabot-metadata.outputs.new-version, 'v0.')
+        run: gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Minor updates (1.0+) ─────────────────────────────────────────────
+      # Enable auto-merge for minor-level bumps, except pre-1.0 packages.
+      # These should still pass the full CI suite before merging, which branch
+      # protection enforces.
+      - name: Enable auto-merge for minor updates
+        if: >-
+          steps.dependabot-metadata.outputs.update-type == 'version-update:semver-minor'
+          && !startsWith(steps.dependabot-metadata.outputs.new-version, '0.')
+          && !startsWith(steps.dependabot-metadata.outputs.new-version, 'v0.')
+        run: gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Major updates ─────────────────────────────────────────────────────
+      # Leave a comment explaining why the PR is NOT auto-merged, so it is
+      # clearly visible to reviewers rather than silently sitting unmerged.
+      - name: Comment on major updates requiring manual review
+        if: steps.dependabot-metadata.outputs.update-type == 'version-update:semver-major'
+        run: |
+          gh pr comment "$PR_URL" --body \
+            "👋 This PR is a **major** version bump and requires **manual review** before merging.
+
+            Please check the upstream changelog for breaking changes, update any
+            affected call-sites, and verify that CI passes end-to-end before
+            approving.
+
+            See the [Dependabot auto-merge policy](../blob/main/CONTRIBUTING.md#dependabot-auto-merge-policy) in \`CONTRIBUTING.md\` for details."
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Pre-1.0 (0.x) updates ─────────────────────────────────────────────
+      # A `0.x` package makes no semver non-breaking guarantee, so even patch
+      # and minor bumps are routed to manual review rather than auto-merged.
+      - name: Comment on pre-1.0 (0.x) updates requiring manual review
+        if: >-
+          startsWith(steps.dependabot-metadata.outputs.new-version, '0.')
+          || startsWith(steps.dependabot-metadata.outputs.new-version, 'v0.')
+        run: |
+          gh pr comment "$PR_URL" --body \
+            "👋 This PR updates a **pre-1.0 (\`0.x\`)** package and requires **manual review** before merging.
+
+            Semver makes no non-breaking guarantee below \`1.0\`, and pre-1.0 releases
+            are also more exposed to a compromised upstream publishing a malicious
+            patch/minor version. Please review the change (and, where practical,
+            confirm the release has been out long enough for the ecosystem to vet it)
+            before approving.
+
+            See the [Dependabot auto-merge policy](../blob/main/CONTRIBUTING.md#dependabot-auto-merge-policy) in \`CONTRIBUTING.md\` for details."
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

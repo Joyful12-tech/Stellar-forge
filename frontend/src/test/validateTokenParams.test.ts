@@ -18,7 +18,7 @@ describe('validateTokenParams - name', () => {
     expect(validateTokenParams({ ...valid, name: 'A' }).valid).toBe(true)
   })
 
-  it('accepts a 32-character name', () => {
+  it('accepts a 32-byte name', () => {
     expect(validateTokenParams({ ...valid, name: 'A'.repeat(32) }).valid).toBe(true)
   })
 
@@ -26,14 +26,36 @@ describe('validateTokenParams - name', () => {
     expect(validateTokenParams({ ...valid, name: '  MyToken  ' }).valid).toBe(true)
   })
 
-  it('rejects a name with special characters', () => {
-    const { valid: ok, errors } = validateTokenParams({ ...valid, name: '<script>' })
+  it('accepts spaces, hyphens, and underscores in a name', () => {
+    expect(validateTokenParams({ ...valid, name: 'My Token_Name' }).valid).toBe(true)
+  })
+
+  it('accepts non-Latin scripts the contract accepts (Café / 日本コイン / Наира / نايرا)', () => {
+    for (const name of ['Café', '日本コイン', 'Наира', 'نايرا']) {
+      expect(validateTokenParams({ ...valid, name }).valid).toBe(true)
+    }
+  })
+
+  it('rejects a name containing a control character', () => {
+    const { valid: ok, errors } = validateTokenParams({ ...valid, name: 'Token\x00Name' })
     expect(ok).toBe(false)
     expect(errors.name).toBeDefined()
   })
 
-  it('rejects a name with HTML entities', () => {
-    const { valid: ok, errors } = validateTokenParams({ ...valid, name: 'Token&Name' })
+  it('rejects a name containing a zero-width space', () => {
+    const { valid: ok, errors } = validateTokenParams({ ...valid, name: 'To\u200Bken' })
+    expect(ok).toBe(false)
+    expect(errors.name).toBeDefined()
+  })
+
+  it('rejects a name containing a bidirectional override', () => {
+    const { valid: ok, errors } = validateTokenParams({ ...valid, name: 'To\u202Eken' })
+    expect(ok).toBe(false)
+    expect(errors.name).toBeDefined()
+  })
+
+  it('rejects an unpaired surrogate name that cannot be UTF-8 encoded', () => {
+    const { valid: ok, errors } = validateTokenParams({ ...valid, name: 'Bad\uD800Name' })
     expect(ok).toBe(false)
     expect(errors.name).toBeDefined()
   })
@@ -44,9 +66,22 @@ describe('validateTokenParams - name', () => {
     expect(errors.name).toBeDefined()
   })
 
-  it('rejects a name over 32 characters', () => {
-    const { valid: ok, errors } = validateTokenParams({ ...valid, name: 'A'.repeat(33) })
+  it('accepts a name of exactly 32 UTF-8 bytes in a multi-byte script', () => {
+    // '日' is 3 UTF-8 bytes; 10 × 3 = 30 bytes, plus 2 ASCII = 32 bytes
+    const name = `${'日'.repeat(10)}ab`
+    const { valid: ok, errors } = validateTokenParams({ ...valid, name })
+    expect(ok).toBe(true)
+    expect(new TextEncoder().encode(name).length).toBe(32)
+    expect(errors.name).toBeUndefined()
+  })
+
+  it('rejects a name over 32 UTF-8 bytes counting bytes not code units', () => {
+    // 11 × 3 = 33 bytes for '日'.repeat(11) — passes a code-unit check
+    // (length 11) but must fail a byte check matching the contract.
+    const name = '日'.repeat(11)
+    const { valid: ok, errors } = validateTokenParams({ ...valid, name })
     expect(ok).toBe(false)
+    expect(new TextEncoder().encode(name).length).toBe(33)
     expect(errors.name).toBeDefined()
   })
 
@@ -63,8 +98,18 @@ describe('validateTokenParams - symbol', () => {
     expect(validateTokenParams({ ...valid, symbol: 'X' }).valid).toBe(true)
   })
 
-  it('accepts a 12-character symbol', () => {
+  it('accepts a 12-byte symbol', () => {
     expect(validateTokenParams({ ...valid, symbol: 'A'.repeat(12) }).valid).toBe(true)
+  })
+
+  it('accepts a symbol with hyphens', () => {
+    expect(validateTokenParams({ ...valid, symbol: 'MY-TOKEN' }).valid).toBe(true)
+  })
+
+  it('rejects a symbol with non-ASCII characters', () => {
+    const { valid: ok, errors } = validateTokenParams({ ...valid, symbol: 'TOKÉN' })
+    expect(ok).toBe(false)
+    expect(errors.symbol).toBeDefined()
   })
 
   it('rejects an empty symbol', () => {
@@ -73,7 +118,7 @@ describe('validateTokenParams - symbol', () => {
     expect(errors.symbol).toBeDefined()
   })
 
-  it('rejects a symbol over 12 characters', () => {
+  it('rejects a symbol over 12 bytes', () => {
     const { valid: ok, errors } = validateTokenParams({ ...valid, symbol: 'A'.repeat(13) })
     expect(ok).toBe(false)
     expect(errors.symbol).toBeDefined()

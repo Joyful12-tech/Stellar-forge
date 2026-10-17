@@ -1,13 +1,14 @@
 /**
  * Build-time script: generates the CSP string from src/csp/policy.ts and
- * writes it into index.html, vercel.json, and public/_headers.
+ * writes it into index.html, public/_headers, and both vercel.json configs
+ * (frontend/vercel.json and the repo-root vercel.json).
  *
  * Usage:
  *   npx tsx scripts/generateCSP.ts          # write mode (run via prebuild)
  *   npx tsx scripts/generateCSP.ts --check  # validate only, exit 1 on drift (CI)
  */
 
-import { readFileSync, writeFileSync } from 'fs'
+import { existsSync, readFileSync, writeFileSync } from 'fs'
 import { resolve, dirname } from 'path'
 import { fileURLToPath } from 'url'
 import { CSP_DIRECTIVES, buildCSPString } from '../src/csp/policy.js'
@@ -23,15 +24,12 @@ const CSP = buildCSPString(CSP_DIRECTIVES)
 const indexPath = resolve(root, 'index.html')
 const indexContent = readFileSync(indexPath, 'utf-8')
 
-const metaTagRegex =
-  /<meta\s+http-equiv="Content-Security-Policy"\s+content="([^"]*)"/
+const metaTagRegex = /<meta\s+http-equiv="Content-Security-Policy"\s+content="([^"]*)"/
 
 const metaMatch = indexContent.match(metaTagRegex)
 
 if (!metaMatch) {
-  console.error(
-    'generateCSP: Content-Security-Policy meta tag not found in index.html',
-  )
+  console.error('generateCSP: Content-Security-Policy meta tag not found in index.html')
   process.exit(1)
 }
 
@@ -39,16 +37,12 @@ const existingMetaCSP = metaMatch[1]
 
 if (existingMetaCSP !== CSP) {
   if (CHECK_ONLY) {
-    console.error(
-      'generateCSP: index.html CSP meta tag is out of sync with policy.ts',
-    )
+    console.error('generateCSP: index.html CSP meta tag is out of sync with policy.ts')
     console.error('  expected:', CSP)
     console.error('  found:   ', existingMetaCSP)
     process.exit(1)
   }
-  const updated = indexContent.replace(metaTagRegex, (match) =>
-    match.replace(existingMetaCSP, CSP),
-  )
+  const updated = indexContent.replace(metaTagRegex, (match) => match.replace(existingMetaCSP, CSP))
   writeFileSync(indexPath, updated)
   console.log('generateCSP: updated index.html')
 } else {
@@ -84,34 +78,40 @@ if (existingCSP !== CSP) {
   console.log('generateCSP: public/_headers is up to date')
 }
 
-// ── vercel.json ───────────────────────────────────────────────────────────────
+// ── vercel.json (frontend + repo root) ───────────────────────────────────────
 
-const vercelPath = resolve(root, 'vercel.json')
-const vercel = JSON.parse(readFileSync(vercelPath, 'utf-8')) as {
-  headers: { source: string; headers: { key: string; value: string }[] }[]
-}
+// Both configs ship a header-CSP and both are documented as authoritative for
+// production deployment, so both must be generated. The root file was
+// previously left out, which is how it drifted from policy.ts unnoticed.
+const vercelPaths = [resolve(root, 'vercel.json'), resolve(root, '../vercel.json')]
 
-const vercelHeader = vercel.headers[0]?.headers.find(
-  (h) => h.key === 'Content-Security-Policy',
-)
+for (const vercelPath of vercelPaths) {
+  if (!existsSync(vercelPath)) continue
 
-if (!vercelHeader) {
-  console.error(
-    'generateCSP: Content-Security-Policy header not found in vercel.json',
-  )
-  process.exit(1)
-}
+  const vercel = JSON.parse(readFileSync(vercelPath, 'utf-8')) as {
+    headers?: { source: string; headers: { key: string; value: string }[] }[]
+  }
 
-if (vercelHeader.value !== CSP) {
-  if (CHECK_ONLY) {
-    console.error('generateCSP: vercel.json CSP is out of sync with policy.ts')
-    console.error('  expected:', CSP)
-    console.error('  found:   ', vercelHeader.value)
+  const vercelHeader = vercel.headers
+    ?.flatMap((block) => block.headers)
+    .find((h) => h.key === 'Content-Security-Policy')
+
+  if (!vercelHeader) {
+    console.error(`generateCSP: Content-Security-Policy header not found in ${vercelPath}`)
     process.exit(1)
   }
-  vercelHeader.value = CSP
-  writeFileSync(vercelPath, JSON.stringify(vercel, null, 2) + '\n')
-  console.log('generateCSP: updated vercel.json')
-} else {
-  console.log('generateCSP: vercel.json is up to date')
+
+  if (vercelHeader.value !== CSP) {
+    if (CHECK_ONLY) {
+      console.error(`generateCSP: ${vercelPath} CSP is out of sync with policy.ts`)
+      console.error('  expected:', CSP)
+      console.error('  found:   ', vercelHeader.value)
+      process.exit(1)
+    }
+    vercelHeader.value = CSP
+    writeFileSync(vercelPath, JSON.stringify(vercel, null, 2) + '\n')
+    console.log(`generateCSP: updated ${vercelPath}`)
+  } else {
+    console.log(`generateCSP: ${vercelPath} is up to date`)
+  }
 }

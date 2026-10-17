@@ -104,6 +104,7 @@ export function useTokenDashboard(): UseTokenDashboardResult {
   // Re-fetch when wallet connects; clear data when wallet disconnects or switches
   useEffect(() => {
     if (wallet.isConnected) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- load sets loading state synchronously; reacting to connect/disconnect is this effect's purpose. See #1002 follow-up
       load()
     } else {
       setAllRows([])

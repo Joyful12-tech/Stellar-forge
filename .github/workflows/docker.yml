@@ -49,7 +49,7 @@ jobs:
 
     - name: Test contract compilation
       run: |
-        docker compose exec -T contract-builder bash -c "cd token-factory && cargo check --target wasm32-unknown-unknown"
+        docker compose exec -T contract-builder bash -c "cd token-factory && cargo check --target wasm32v1-none"
 
     - name: Test frontend build
       run: |

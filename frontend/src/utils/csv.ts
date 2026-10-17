@@ -14,7 +14,13 @@ export function serializeTransactionsToCSV(transactions: TransactionHistoryItem[
     const fields = [tx.date || '', tx.type || '', tx.token || '', tx.amount || '', tx.hash || '']
 
     return fields.map((field) => {
-      const valStr = String(field)
+      let valStr = String(field)
+      // Formula-injection guard (CWE-1236): spreadsheet apps execute cells
+      // starting with these characters as formulas, so neutralize them with a
+      // leading apostrophe before the value reaches an exported file.
+      if (/^[=+\-@\t\r]/.test(valStr)) {
+        valStr = `'${valStr}`
+      }
       // Escape double quotes by doubling them
       const escaped = valStr.replace(/"/g, '""')
       // If the field contains commas, double quotes, or newlines, wrap it in double quotes

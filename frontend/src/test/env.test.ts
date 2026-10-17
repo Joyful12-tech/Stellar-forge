@@ -26,21 +26,26 @@ describe('env config', () => {
     expect(isFactoryConfigured()).toBe(true)
   })
 
-  it('isIpfsConfigured returns false when both keys are empty', async () => {
-    const { isIpfsConfigured } = await loadEnv({})
-    expect(isIpfsConfigured()).toBe(false)
-  })
-
-  it('isIpfsConfigured returns false when only one key is set', async () => {
-    const { isIpfsConfigured } = await loadEnv({ VITE_IPFS_API_KEY: 'key' })
-    expect(isIpfsConfigured()).toBe(false)
-  })
-
-  it('isIpfsConfigured returns true when both keys are set', async () => {
-    const { isIpfsConfigured } = await loadEnv({
-      VITE_IPFS_API_KEY: 'key',
-      VITE_IPFS_API_SECRET: 'secret',
+  // Issue #921. Vite inlines every VITE_-prefixed variable into the built
+  // bundle, so anything ENV reads from one is readable by every visitor.
+  // Pinata credentials must never make that trip: they belong to the server
+  // (PINATA_API_KEY / PINATA_API_SECRET, read by api/_lib/pinata.ts).
+  it('never carries Pinata credentials, even when the VITE_ vars are set', async () => {
+    const { ENV } = await loadEnv({
+      VITE_IPFS_API_KEY: 'leaked-key',
+      VITE_IPFS_API_SECRET: 'leaked-secret',
     })
-    expect(isIpfsConfigured()).toBe(true)
+
+    const serialised = JSON.stringify(ENV)
+    expect(serialised).not.toContain('leaked-key')
+    expect(serialised).not.toContain('leaked-secret')
+  })
+
+  it('exposes no IPFS-credential helper for components to gate on', async () => {
+    // `isIpfsConfigured()` derived upload availability from client-side
+    // secrets, which is what made shipping them look necessary. Readiness now
+    // comes from the server via useIpfsReady() → GET /api/health/ipfs.
+    const mod = await loadEnv({})
+    expect(mod).not.toHaveProperty('isIpfsConfigured')
   })
 })

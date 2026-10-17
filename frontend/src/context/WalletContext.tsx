@@ -172,6 +172,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
   // Refresh balance when network changes
   useEffect(() => {
     if (wallet.isConnected && wallet.address) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- fetchBalance sets loading state as it starts; re-fetching on network change is the point of this effect. See #1002 follow-up
       fetchBalance(wallet.address)
     }
   }, [network, fetchBalance, wallet.isConnected, wallet.address])

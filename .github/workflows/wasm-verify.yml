@@ -27,23 +27,29 @@ permissions:
   issues: write
 
 jobs:
-  verify-wasm:
-    name: Verify Deployed WASM Hash
+  # Gate the expensive verification behind its own job. A `run:` step that
+  # decides to skip can only `exit 0` out of itself — every later step in the
+  # same job still runs — so the weekly schedule used to proceed with an empty
+  # contract ID and fail during the build. A separate job lets the skip be
+  # expressed where it actually skips work: `needs` + `if`.
+  preflight:
+    name: Check verification inputs
     runs-on: ubuntu-latest
-    # Use the inputs when triggered manually; for scheduled runs, use
-    # repository variables (which must be configured for the schedule to work).
+    outputs:
+      proceed: ${{ steps.validate.outputs.proceed }}
     env:
-      GIT_REF: ${{ github.event.inputs.git_ref || 'main' }}
-      FACTORY_CONTRACT_ID: ${{ github.event.inputs.factory_contract_id || '' }}
-      RPC_URL: ${{ github.event.inputs.rpc_url || 'https://soroban-mainnet.stellar.org' }}
-      NETWORK_PASSPHRASE: ${{ github.event.inputs.network_passphrase || 'Public Global Stellar Network ; September 2015' }}
-
+      # Manual runs pass the contract ID as an input; the weekly schedule has
+      # no inputs, so it falls back to the repository variable of the same
+      # name (this is the variable the skip notice below tells you to set).
+      FACTORY_CONTRACT_ID: ${{ github.event.inputs.factory_contract_id || vars.FACTORY_CONTRACT_ID || '' }}
     steps:
       - name: Validate required inputs
+        id: validate
         run: |
           if [ "$GITHUB_EVENT_NAME" = "schedule" ] && [ -z "$FACTORY_CONTRACT_ID" ]; then
             echo "::notice::Scheduled run skipped: FACTORY_CONTRACT_ID is not configured as a repository variable."
             echo "Set the FACTORY_CONTRACT_ID repository variable to enable scheduled WASM verification."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           if [ -z "$FACTORY_CONTRACT_ID" ]; then
@@ -54,7 +60,22 @@ jobs:
             echo "::error::FACTORY_CONTRACT_ID '$FACTORY_CONTRACT_ID' does not look like a valid Stellar contract address."
             exit 1
           fi
+          echo "proceed=true" >> "$GITHUB_OUTPUT"
 
+  verify-wasm:
+    name: Verify Deployed WASM Hash
+    runs-on: ubuntu-latest
+    needs: preflight
+    if: needs.preflight.outputs.proceed == 'true'
+    # Use the inputs when triggered manually; for scheduled runs, use
+    # repository variables (which must be configured for the schedule to work).
+    env:
+      GIT_REF: ${{ github.event.inputs.git_ref || 'main' }}
+      FACTORY_CONTRACT_ID: ${{ github.event.inputs.factory_contract_id || vars.FACTORY_CONTRACT_ID || '' }}
+      RPC_URL: ${{ github.event.inputs.rpc_url || 'https://soroban-mainnet.stellar.org' }}
+      NETWORK_PASSPHRASE: ${{ github.event.inputs.network_passphrase || 'Public Global Stellar Network ; September 2015' }}
+
+    steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ env.GIT_REF }}
@@ -71,7 +92,13 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-unknown-unknown
+          # Must match the target the contract is actually shipped from
+          # (ci.yml's Contract Build). soroban-sdk 27 refuses to build for
+          # wasm32-unknown-unknown on Rust 1.82+ — its build.rs panics because
+          # that target now enables reference-types and multi-value, which the
+          # Soroban environment does not support. Building the wrong target
+          # here meant this workflow could never produce a hash to compare.
+          targets: wasm32v1-none
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -86,17 +113,19 @@ jobs:
       - name: Reproducible build of token-factory
         working-directory: contracts/token-factory
         run: |
-          echo "▶ Building with cargo (target: wasm32-unknown-unknown, release)..."
+          echo "▶ Building with cargo (target: wasm32v1-none, release)..."
           # Use the Cargo.lock committed in the repo for reproducible deps.
-          cargo build --target wasm32-unknown-unknown --release --locked
+          cargo build --target wasm32v1-none --release --locked
 
           echo "▶ Optimizing with wasm-opt -Oz..."
+          # The cargo workspace root is `contracts/`, so the target directory
+          # is `contracts/target` — one level up from here, not two.
           wasm-opt -Oz \
-            ../../target/wasm32-unknown-unknown/release/token_factory.wasm \
-            -o ../../target/wasm32-unknown-unknown/release/token_factory.optimized.wasm
+            ../target/wasm32v1-none/release/token_factory.wasm \
+            -o ../target/wasm32v1-none/release/token_factory.optimized.wasm
 
           echo "▶ Computing SHA-256 of optimized WASM..."
-          sha256sum ../../target/wasm32-unknown-unknown/release/token_factory.optimized.wasm \
+          sha256sum ../target/wasm32v1-none/release/token_factory.optimized.wasm \
             | tee /tmp/built-wasm.sha256
 
       - name: Capture built WASM hash
@@ -182,15 +211,15 @@ jobs:
 
       - name: Upload built WASM artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: built-wasm-${{ steps.meta.outputs.commit_short }}
-          path: target/wasm32-unknown-unknown/release/token_factory.optimized.wasm
+          path: contracts/target/wasm32v1-none/release/token_factory.optimized.wasm
           retention-days: 90
 
       - name: Upload deployed WASM artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: deployed-wasm-${{ steps.meta.outputs.commit_short }}
           path: /tmp/deployed.wasm
@@ -198,7 +227,7 @@ jobs:
 
       - name: Create issue on mismatch
         if: failure() && steps.deployed-hash.outcome == 'success'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const built = '${{ steps.built-hash.outputs.hash }}';

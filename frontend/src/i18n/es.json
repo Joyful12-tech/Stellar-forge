@@ -77,7 +77,10 @@
     "walletNotConnected": "La billetera no está conectada",
     "validationFailed": "Corrija los errores en el formulario",
     "submitError": "Error al enviar el formulario",
-    "deployedSuccessfully": "¡desplegado con éxito!"
+    "deployedSuccessfully": "¡desplegado con éxito!",
+    "maxSupplyLabel": "Suministro máximo (opcional)",
+    "maxSupplyPlaceholder": "Dejar vacío para ilimitado",
+    "maxSupplyHelp": "Un límite máximo del suministro total. Una vez establecido no se puede cambiar, y la emisión que lo supere será rechazada."
   },
   "mintForm": {
     "tokenAddress": "Dirección del Token",

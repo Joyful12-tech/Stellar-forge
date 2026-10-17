@@ -26,18 +26,10 @@ const ENV_VARS: EnvVar[] = [
     description: 'WASM hash of the token contract',
     required: true,
   },
-  {
-    key: 'VITE_IPFS_API_KEY',
-    value: import.meta.env.VITE_IPFS_API_KEY,
-    description: 'Pinata IPFS API key',
-    required: true,
-  },
-  {
-    key: 'VITE_IPFS_API_SECRET',
-    value: import.meta.env.VITE_IPFS_API_SECRET,
-    description: 'Pinata IPFS API secret',
-    required: true,
-  },
+  // No VITE_IPFS_* entries: Pinata credentials are server-only env
+  // (PINATA_API_KEY / PINATA_API_SECRET, read by api/_lib/pinata.ts). Listing
+  // them here as required frontend vars is what pushed operators into baking
+  // the secrets into the browser bundle (issue #921).
   {
     key: 'VITE_SENTRY_DSN',
     value: import.meta.env.VITE_SENTRY_DSN,
